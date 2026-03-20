@@ -1,0 +1,3806 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Game</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;700&display=swap" rel="stylesheet">
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body {
+  background:#242220;
+  overflow:hidden;
+  width:100vw; height:100vh;
+}
+canvas {
+  display:block;
+  position:fixed;
+  top:0; left:0;
+  width:100vw; height:100vh;
+}
+#hint { display:none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hint">
+  P1: A/D move · W jump · F attack &nbsp;&nbsp;|&nbsp;&nbsp; P2: ←/→ move · ↑ jump · ; attack
+</div>
+<script>
+'use strict';
+
+const canvas = document.getElementById('c');
+const ctx    = canvas.getContext('2d');
+const W = 960, H = 520;
+
+function resize() {
+  canvas.width  = window.innerWidth;
+  canvas.height = window.innerHeight;
+}
+resize();
+window.addEventListener('resize', resize);
+
+const GND    = 430;
+const GRAV   = 0.52;
+const JUMP_V = -13.5;
+const SPD    = 3.7;
+
+const HEAD_R = 10;
+const BODY_H = 25;
+const LEG_H  = 23;
+const LIMB_W = 2.3;
+const PW     = 28;
+const PH     = HEAD_R*2 + 6 + BODY_H + LEG_H + 4;
+
+const ATK_START   = 85;
+const ATK_ACT     = 130;
+const ATK_REC     = 100;
+const ATK_RANGE   = 88;
+const STUN_MS     = 530;
+const RAGD_MS     = 1250;
+const SLAM_MS     = 1600;
+const COMBO_RESET = 2600;
+const DMG_HIT  = 2;
+const DMG_KB   = 5;
+const DMG_SLAM = 15;
+
+const S = { IDLE:'idle', WALK:'walk', AIR:'air', ATCK:'atck',
+            DIVE:'dive', STUN:'stun', RAGD:'ragd', SLAM:'slam', DEAD:'dead',
+            CLEAVE:'cleave', DISMANTLE:'dismantle', FUGA:'fuga', LAPSE:'lapse',
+            REVERSAL:'reversal', HOLLOW:'hollow', DOMAIN:'domain',
+            BLACKFLASH:'blackflash', BLACKBLUR:'blackblur' };
+
+// Black Blur constants
+const BB_LUNGE_DIST  = 10 * 9.6;  // 10 blocks (1 block = BLOCK px)
+const BB_LUNGE_SPD   = 18;         // px per frame during lunge
+const BB_PUNCH1_DUR  = 420;        // ms first punch (longer wind-up)
+const BB_PUNCH2_DUR  = 420;        // ms second punch
+const BB_SLOW_DUR    = 600;        // ms of slow motion before kick (shorter = tighter window)
+const BB_KICK_DUR    = 320;        // ms kick animation
+const BB_DMG_HIT     = 8;          // each punch
+const BB_DMG_KICK    = 9;          // kick without BF (total ~25)
+const BB_DMG_BF_KICK = 24;         // kick with BF (total ~40)
+const BB_COOLDOWN    = 4000;
+const BB_LINE_SPEED  = 3.8;        // px/ms factor — one pass across 140px bar in ~330ms real time
+
+const BF_MINIGAME_DUR  = 2500;  // ms minigame is active
+const BF_LINE_SPEED    = 2.2;   // px/ms across bar
+const BF_BAR_W         = 140;   // minigame bar width
+const BF_GOAL_W        = 18;    // goal zone width (narrower = harder)
+const BF_WINDOW        = 600;   // ms window to hit F after winning
+const BF_DMG           = 30;    // black flash damage
+
+// Piercing Blood (Yuji ability)
+const PB_RANGE         = W * 0.5;
+const PB_CHARGE_MAX    = 3000;
+const PB_DMG_1         = 10;
+const PB_DMG_2         = 20;
+const PB_DMG_3         = 30;
+const PB_COOLDOWN      = 2200;
+
+const piercingBeams = [];
+function addPiercingBeam(x, y, dir, owner, dmg){
+  piercingBeams.push({ x, y, dir, owner, dmg, life:1, length:0 });
+}
+function tickPiercingBeams(dt, p1, p2){
+  for(let i=piercingBeams.length-1;i>=0;i--){
+    const b=piercingBeams[i];
+    b.length = Math.min(PB_RANGE, b.length + 28*(dt/16.67));
+    if(!b.hit){
+      const def = b.owner===p1 ? p2 : p1;
+      if(def.hittable){
+        const db=def.bodyBox();
+        const bx=b.dir===1 ? b.x : b.x-b.length;
+        const hitBox={x:bx, y:b.y-12, w:b.length, h:24};
+        if(overlaps(hitBox,db)){
+          b.hit=true;
+          const mx=def.x+PW/2, my=def.y+PH/2;
+          def.hp=Math.max(0,def.hp-b.dmg); def.flash=250;
+          addParts(mx,my,'#8b0000',10,4); addRing(mx,my,'#cc1111',45);
+          addDmg(mx,def.y-14,b.dmg,'#cc1111'); doShake(7);
+          b.owner.domainCharge=Math.min(DOMAIN_CHARGE_REQ,b.owner.domainCharge+b.dmg);
+          if(def.hp<=0){ def._initRd(b.dir*8,-5,.1*b.dir); def.ss(S.DEAD); }
+          else { def._initRd(b.dir*7,-4,.09*b.dir); def.ss(S.RAGD,RAGD_MS); }
+        }
+      }
+    }
+    b.life -= dt*0.0018;
+    if(b.life<=0) piercingBeams.splice(i,1);
+  }
+}
+function drawPiercingBeams(){
+  const t=Date.now();
+  for(const b of piercingBeams){
+    ctx.save();
+    ctx.translate(b.x, b.y);
+    const endX = b.dir * b.length;
+    const a = b.life;
+    ctx.lineCap='round';
+    // Outer dark glow
+    ctx.globalAlpha=a*0.3;
+    ctx.strokeStyle='rgba(80,0,0,0.7)'; ctx.lineWidth=20;
+    ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(endX,0); ctx.stroke();
+    // Core dark blood beam
+    ctx.globalAlpha=a*0.95;
+    ctx.strokeStyle='#3a0000'; ctx.lineWidth=8;
+    ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(endX,0); ctx.stroke();
+    // Mid layer
+    ctx.strokeStyle='#8b0000'; ctx.lineWidth=4;
+    ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(endX,0); ctx.stroke();
+    // Bright center streak
+    ctx.strokeStyle='#cc1111'; ctx.lineWidth=1.8;
+    ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(endX,0); ctx.stroke();
+    // Helical wrap — dark crimson sinusoid
+    const steps=Math.max(2,Math.floor(b.length/3));
+    ctx.globalAlpha=a*0.85;
+    ctx.strokeStyle='#660000'; ctx.lineWidth=2;
+    ctx.beginPath();
+    for(let s=0;s<=steps;s++){
+      const px=b.dir*(s/steps)*b.length;
+      const py=Math.sin(s*0.5+t*0.009)*6;
+      s===0?ctx.moveTo(px,py):ctx.lineTo(px,py);
+    }
+    ctx.stroke();
+    // Second helix offset π — brighter red accent
+    ctx.strokeStyle='#ff2222'; ctx.lineWidth=1.2;
+    ctx.globalAlpha=a*0.55;
+    ctx.beginPath();
+    for(let s=0;s<=steps;s++){
+      const px=b.dir*(s/steps)*b.length;
+      const py=Math.sin(s*0.5+t*0.009+Math.PI)*6;
+      s===0?ctx.moveTo(px,py):ctx.lineTo(px,py);
+    }
+    ctx.stroke();
+    ctx.restore();
+    ctx.globalAlpha=1;
+  }
+}
+
+const FUGA_WINDUP    = 2200;  // ms bow-draw (long, deliberate)
+const FUGA_SPEED     = 12;
+const FUGA_DMG       = 55;
+const FUGA_CHARGE_REQ = 40;
+const FUGA_EXPLOSION_R = 90;
+
+// Flame trail particles attached to fuga shots
+const flameTrails = [];
+function spawnFlameTrail(x, y){
+  // Spawn multiple particles per call for density
+  for(let i=0;i<3;i++){
+    const spread = (Math.random()-0.5)*14;
+    flameTrails.push({
+      x: x + (Math.random()-0.5)*8,
+      y: y + spread,
+      vx: (Math.random()-0.5)*1.8,
+      vy: -1.8 - Math.random()*3.2,
+      life: 1,
+      decay: 0.022 + Math.random()*0.018,
+      r: 7 + Math.random()*11,
+      hue: 10 + Math.random()*40
+    });
+  }
+}
+function tickFlameTrails(dt){
+  const f=dt/16.67;
+  for(let i=flameTrails.length-1;i>=0;i--){
+    const p=flameTrails[i];
+    p.x+=p.vx*f; p.y+=p.vy*f; p.vy-=0.04*f;
+    p.life-=p.decay*(dt/16.67);
+    if(p.life<=0) flameTrails.splice(i,1);
+  }
+}
+function drawFlameTrails(){
+  for(const p of flameTrails){
+    ctx.save();
+    ctx.globalAlpha = p.life * 0.75;
+    const r = p.r * p.life;
+    const grad = ctx.createRadialGradient(p.x,p.y,0,p.x,p.y,r);
+    grad.addColorStop(0, `hsla(${p.hue+30},100%,90%,1)`);
+    grad.addColorStop(0.4, `hsla(${p.hue},100%,55%,0.8)`);
+    grad.addColorStop(1, `hsla(${p.hue-10},100%,30%,0)`);
+    ctx.fillStyle=grad;
+    ctx.beginPath(); ctx.arc(p.x,p.y,r,0,Math.PI*2); ctx.fill();
+    ctx.restore();
+  }
+  ctx.globalAlpha=1;
+}
+
+// Explosions — fiery pillar
+const explosions = [];
+function addExplosion(x, y){
+  // Dense burst of flame particles spread across full pillar height
+  for(let j=0;j<90;j++){
+    const upward = Math.random() < 0.6;
+    flameTrails.push({
+      x: x + (Math.random()-0.5)*55,
+      y: upward ? y - Math.random()*y : y + Math.random()*(H-y),
+      vx: (Math.random()-0.5)*5,
+      vy: upward ? -5 - Math.random()*10 : 4 + Math.random()*8,
+      life: 1,
+      decay: 0.007 + Math.random()*0.010,
+      r: 14 + Math.random()*24,
+      hue: 10 + Math.random()*40
+    });
+  }
+  explosions.push({x, y, r:6, maxR:FUGA_EXPLOSION_R*1.6, life:1, pillarLife:1});
+}
+function tickExplosions(dt){
+  for(let i=explosions.length-1;i>=0;i--){
+    const e=explosions[i];
+    e.r += (e.maxR-e.r)*0.16;
+    e.life -= dt*0.0016;
+    e.pillarLife -= dt*0.0011;
+    if(e.life<=0) explosions.splice(i,1);
+  }
+}
+function drawExplosions(){
+  for(const e of explosions){
+    ctx.save();
+
+    // Pillar upward — impact point to top of arena
+    if(e.pillarLife>0){
+      const pw = 80 + (1-e.pillarLife)*60;
+
+      // Upper pillar (top of arena down to impact)
+      const upGrad = ctx.createLinearGradient(0, e.y, 0, 0);
+      upGrad.addColorStop(0,   `rgba(255,255,180,${e.pillarLife*1.0})`);
+      upGrad.addColorStop(0.08,`rgba(255,200,40,${e.pillarLife*0.95})`);
+      upGrad.addColorStop(0.3, `rgba(255,80,10,${e.pillarLife*0.75})`);
+      upGrad.addColorStop(0.7, `rgba(180,20,0,${e.pillarLife*0.4})`);
+      upGrad.addColorStop(1,   `rgba(80,0,0,0)`);
+      ctx.fillStyle = upGrad;
+      ctx.fillRect(e.x - pw/2, 0, pw, e.y);
+
+      // Lower pillar (impact point to bottom of arena)
+      const downGrad = ctx.createLinearGradient(0, e.y, 0, H);
+      downGrad.addColorStop(0,   `rgba(255,255,180,${e.pillarLife*1.0})`);
+      downGrad.addColorStop(0.08,`rgba(255,200,40,${e.pillarLife*0.95})`);
+      downGrad.addColorStop(0.3, `rgba(255,80,10,${e.pillarLife*0.75})`);
+      downGrad.addColorStop(0.7, `rgba(180,20,0,${e.pillarLife*0.4})`);
+      downGrad.addColorStop(1,   `rgba(80,0,0,0)`);
+      ctx.fillStyle = downGrad;
+      ctx.fillRect(e.x - pw/2, e.y, pw, H - e.y);
+
+      // Blazing white-hot core streak (full height)
+      const coreGrad = ctx.createLinearGradient(0, 0, 0, H);
+      coreGrad.addColorStop(0,   `rgba(255,255,255,0)`);
+      coreGrad.addColorStop(0.3, `rgba(255,255,220,${e.pillarLife*0.7})`);
+      coreGrad.addColorStop(0.5, `rgba(255,255,255,${e.pillarLife*0.95})`);
+      coreGrad.addColorStop(0.7, `rgba(255,255,220,${e.pillarLife*0.7})`);
+      coreGrad.addColorStop(1,   `rgba(255,255,255,0)`);
+      ctx.fillStyle = coreGrad;
+      ctx.fillRect(e.x - pw*0.12, 0, pw*0.24, H);
+    }
+
+    // Multiple expanding shockwave rings at impact point
+    for(let ring=0;ring<3;ring++){
+      const rScale = 1 + ring*0.35;
+      const rAlpha = Math.max(0, e.life - ring*0.22);
+      ctx.globalAlpha = rAlpha * 0.9;
+      ctx.strokeStyle = ring===0 ? `hsl(50,100%,85%)` : ring===1 ? `hsl(30,100%,60%)` : `hsl(15,100%,45%)`;
+      ctx.lineWidth = (5-ring*1.2)*e.life;
+      ctx.beginPath(); ctx.arc(e.x, e.y, e.r*rScale, 0, Math.PI*2); ctx.stroke();
+    }
+
+    // Hot core flash at impact
+    ctx.globalAlpha = e.life * 0.5;
+    const coreFlash = ctx.createRadialGradient(e.x,e.y,0,e.x,e.y,e.maxR*0.55);
+    coreFlash.addColorStop(0,'rgba(255,255,230,1)');
+    coreFlash.addColorStop(0.4,'rgba(255,160,20,0.7)');
+    coreFlash.addColorStop(1,'rgba(255,60,0,0)');
+    ctx.fillStyle=coreFlash;
+    ctx.beginPath(); ctx.arc(e.x,e.y,e.maxR*0.55,0,Math.PI*2); ctx.fill();
+
+    ctx.restore();
+    ctx.globalAlpha=1;
+  }
+}
+
+// Fuga projectiles
+const fugaShots = [];
+function addFugaShot(x,y,dir,owner){
+  fugaShots.push({x,y,dir,owner,hit:false,trailTimer:0});
+}
+function triggerFugaExplosion(x,y){
+  addExplosion(x,y);
+  addRing(x,y,'#f60',FUGA_EXPLOSION_R);
+  doShake(18);
+}
+function tickFugaShots(dt){
+  for(let i=fugaShots.length-1;i>=0;i--){
+    const s=fugaShots[i];
+    s.x += s.dir * FUGA_SPEED * (dt/16.67);
+    // Spawn flame trail
+    s.trailTimer+=dt;
+    if(s.trailTimer>10){ s.trailTimer=0; spawnFlameTrail(s.x,s.y); spawnFlameTrail(s.x,s.y); }
+    // Wall hit — explode
+    if(s.x < 10 || s.x > W-10){
+      triggerFugaExplosion(s.x, s.y);
+      addParts(s.x,s.y,'#f80',16,6);
+      fugaShots.splice(i,1);
+    }
+  }
+}
+function drawFugaShots(){
+  for(const s of fugaShots){
+    ctx.save();
+    ctx.translate(s.x, s.y);
+
+    // Elongated flame body — pointed tip forward, fading tail behind
+    const tipX  = s.dir * 28;   // front tip
+    const tailX = -s.dir * 48;  // back of tail
+    const bodyH = 7;             // half-height at widest point
+
+    // Main flame body gradient (horizontal)
+    const grad = ctx.createLinearGradient(tailX, 0, tipX, 0);
+    grad.addColorStop(0,   'rgba(150,20,0,0)');
+    grad.addColorStop(0.35,'rgba(230,60,0,0.85)');
+    grad.addColorStop(0.7, 'rgba(255,160,20,1)');
+    grad.addColorStop(1,   'rgba(255,250,200,1)');
+
+    // Arrow/teardrop path: pointed at front tip, tapering at tail
+    ctx.beginPath();
+    ctx.moveTo(tipX, 0);                          // front tip
+    ctx.bezierCurveTo(
+      tipX - s.dir*14, -bodyH,
+      s.dir*4,         -bodyH,
+      tailX,            0
+    );
+    ctx.bezierCurveTo(
+      s.dir*4,          bodyH,
+      tipX - s.dir*14,  bodyH,
+      tipX,             0
+    );
+    ctx.closePath();
+    ctx.fillStyle = grad;
+    ctx.fill();
+
+    // Hot white core streak down the center
+    const coreGrad = ctx.createLinearGradient(tailX*0.4, 0, tipX, 0);
+    coreGrad.addColorStop(0, 'rgba(255,200,100,0)');
+    coreGrad.addColorStop(0.5,'rgba(255,255,220,0.9)');
+    coreGrad.addColorStop(1, 'rgba(255,255,255,1)');
+    ctx.beginPath();
+    ctx.moveTo(tipX, 0);
+    ctx.bezierCurveTo(tipX-s.dir*10, -2.5, s.dir*2, -2.5, tailX*0.4, 0);
+    ctx.bezierCurveTo(s.dir*2, 2.5, tipX-s.dir*10, 2.5, tipX, 0);
+    ctx.closePath();
+    ctx.fillStyle = coreGrad;
+    ctx.fill();
+
+    // Flickering outer glow
+    ctx.globalAlpha = 0.3 + 0.2*Math.sin(Date.now()*0.03);
+    const glowGrad = ctx.createLinearGradient(tailX, 0, tipX, 0);
+    glowGrad.addColorStop(0, 'rgba(200,40,0,0)');
+    glowGrad.addColorStop(1, 'rgba(255,120,0,0.4)');
+    ctx.fillStyle = glowGrad;
+    ctx.beginPath();
+    ctx.ellipse(s.dir*(tipX-s.dir*20)*0.5, 0, Math.abs(tipX - tailX)*0.55, bodyH+5, 0, 0, Math.PI*2);
+    ctx.fill();
+
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
+}
+
+const BLOCK = 960 / 100;
+
+// ── LAPSE BLUE (Gojo) ──────────────────────────────────────
+const LAPSE_SPAWN_DIST  = 2  * BLOCK;
+const LAPSE_PULL_RADIUS = 13 * BLOCK;
+const LAPSE_DURATION    = 2200;
+const LAPSE_CAST        = 280;
+const LAPSE_PULL_FORCE  = 0.38;
+const LAPSE_DMG         = 12;
+const LAPSE_COOLDOWN    = 4000;
+
+const lapseOrbs = [];
+function addLapseOrb(x, y, owner){
+  lapseOrbs.push({ x, y, owner, life:1, timer:LAPSE_DURATION, rot:0, hit:false });
+}
+function tickLapseOrbs(dt, p1, p2){
+  for(let i=lapseOrbs.length-1;i>=0;i--){
+    const orb=lapseOrbs[i];
+    orb.timer -= dt;
+    orb.life = Math.max(0, orb.timer / LAPSE_DURATION);
+    orb.rot += dt * 0.005;
+    if(orb.timer<=0){ lapseOrbs.splice(i,1); continue; }
+    const def = orb.owner===p1 ? p2 : p1;
+    if(!def.hittable) continue;
+    const dx = orb.x - (def.x + PW/2);
+    const dy = orb.y - (def.y + PH/2);
+    const dist = Math.sqrt(dx*dx+dy*dy);
+    if(dist < LAPSE_PULL_RADIUS && dist > 0.1){
+      const pullStr = LAPSE_PULL_FORCE * (1 - dist/LAPSE_PULL_RADIUS) * (dt/16.67);
+      def.vx += (dx/dist) * pullStr * 4.5;
+      def.vy += (dy/dist) * pullStr * 2.8;
+      if(dist < 22 && !orb.hit){
+        orb.hit = true;
+        def.hp = Math.max(0, def.hp - LAPSE_DMG);
+        def.flash = 350;
+        addDmg(orb.x, orb.y - 18, LAPSE_DMG, '#4af');
+        addParts(orb.x, orb.y, '#06f', 14, 5);
+        addRing(orb.x, orb.y, '#4af', 55);
+        doShake(8);
+        // Charge Hollow Purple
+        if(orb.owner.type==='gojo')
+          orb.owner.hollowCharge = Math.min(HOLLOW_CHARGE_REQ, orb.owner.hollowCharge + LAPSE_DMG);
+          orb.owner.domainCharge = Math.min(DOMAIN_CHARGE_REQ, orb.owner.domainCharge + LAPSE_DMG);
+        if(def.hp<=0){ def._initRd(0,-5,0.08); def.ss(S.DEAD); }
+        else { def.vx=0; def.vy=-4; def.ss(S.STUN, 900); }
+      }
+    }
+  }
+}
+function drawLapseOrbs(){
+  for(const orb of lapseOrbs){
+    ctx.save();
+    ctx.translate(orb.x, orb.y);
+    const a = orb.life;
+    // Dark void core
+    const coreGrad = ctx.createRadialGradient(0,0,0,0,0,18);
+    coreGrad.addColorStop(0,   `rgba(0,0,0,${a})`);
+    coreGrad.addColorStop(0.55,`rgba(0,20,80,${a*0.9})`);
+    coreGrad.addColorStop(1,   `rgba(0,60,200,0)`);
+    ctx.globalAlpha = a;
+    ctx.fillStyle = coreGrad;
+    ctx.beginPath(); ctx.arc(0,0,18,0,Math.PI*2); ctx.fill();
+    // Swirling arms
+    for(let arm=0;arm<3;arm++){
+      ctx.save();
+      ctx.rotate(orb.rot + arm*(Math.PI*2/3));
+      ctx.globalAlpha = a * 0.75;
+      ctx.strokeStyle = `rgba(40,140,255,${a})`;
+      ctx.lineWidth = 2.5;
+      ctx.beginPath();
+      for(let t=0;t<=1;t+=0.04){
+        const r = 10 + t*26, ang = -t*2.2;
+        const px=Math.cos(ang)*r, py=Math.sin(ang)*r;
+        t===0 ? ctx.moveTo(px,py) : ctx.lineTo(px,py);
+      }
+      ctx.stroke();
+      ctx.fillStyle=`rgba(120,200,255,${a})`;
+      ctx.beginPath(); ctx.arc(Math.cos(-2.2)*36, Math.sin(-2.2)*36, 2.5,0,Math.PI*2); ctx.fill();
+      ctx.restore();
+    }
+    // Outer glow ring
+    ctx.globalAlpha = a * 0.4;
+    ctx.strokeStyle = '#4af'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(0,0,36,0,Math.PI*2); ctx.stroke();
+    // Pull radius indicator
+    ctx.globalAlpha = a * 0.07;
+    ctx.strokeStyle = '#4af'; ctx.lineWidth = 1;
+    ctx.setLineDash([6,8]);
+    ctx.beginPath(); ctx.arc(0,0,LAPSE_PULL_RADIUS,0,Math.PI*2); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
+}
+
+const REVERSAL_WINDUP   = 380;   // ms arm raise before firing
+const REVERSAL_SPEED    = 22;    // fast!
+const REVERSAL_DMG      = 14;
+const REVERSAL_COOLDOWN = 2800;
+const REVERSAL_KB       = 13;    // knockback strength
+
+const reversalShots = [];
+function addReversalShot(x, y, dir, owner){
+  reversalShots.push({ x, y, dir, owner, hit:false });
+}
+function tickReversalShots(dt){
+  for(let i=reversalShots.length-1;i>=0;i--){
+    const s=reversalShots[i];
+    const f=dt/16.67;
+    if(s.vx!==undefined){
+      s.x += s.vx*f; s.y += s.vy*f;
+    } else {
+      s.x += s.dir * REVERSAL_SPEED * f;
+    }
+    if(s.x < -80 || s.x > W+80 || s.y < -80 || s.y > H+80) reversalShots.splice(i,1);
+  }
+}
+function drawReversalShots(){
+  for(const s of reversalShots){
+    ctx.save();
+    const angle = s.vx!==undefined ? Math.atan2(s.vy, s.vx) : 0;
+    ctx.translate(s.x, s.y);
+    ctx.rotate(angle);
+    const rw=52, rh=14;
+    ctx.shadowColor='#f00'; ctx.shadowBlur=18;
+    ctx.fillStyle='rgba(200,0,0,0.35)';
+    ctx.fillRect(-rw/2 - 8, -rh/2 - 6, rw+16, rh+12);
+    ctx.shadowBlur=10;
+    ctx.fillStyle='#c00';
+    ctx.fillRect(-rw/2, -rh/2, rw, rh);
+    ctx.shadowBlur=0;
+    ctx.fillStyle='rgba(255,160,160,0.9)';
+    ctx.fillRect(-rw/2+4, -3, rw-8, 6);
+    ctx.fillStyle='#fff';
+    ctx.fillRect(rw/2-4, -rh/2+2, 4, rh-4);
+    ctx.restore();
+    ctx.globalAlpha=1;
+  }
+}
+function addReversalExplosion(x, y, dir){
+  // Small red burst
+  for(let i=0;i<10;i++){
+    const a=Math.random()*Math.PI*2, spd=2+Math.random()*4;
+    parts.push({x,y,vx:Math.cos(a)*spd+dir*2,vy:Math.sin(a)*spd-1.5,
+      life:1,decay:.03+Math.random()*.025,r:2+Math.random()*4,col:'#f44'});
+  }
+  addRing(x,y,'#f44',50);
+  doShake(7);
+}
+
+// ── HOLLOW PURPLE (Gojo ultimate) ──────────────────────────
+const HOLLOW_WINDUP      = 2400;  // ms — two balls converge then fire
+const HOLLOW_SPEED       = 9;
+const HOLLOW_DMG         = 50;
+const HOLLOW_CHARGE_REQ  = 40;
+const HOLLOW_BALL_R      = 22;    // projectile radius
+
+const hollowShots = [];
+
+// ── HOLLOW NUKE (Gojo domain combo: Blue → Red into Blue) ──
+const HOLLOW_NUKE_CHARGE_TIME = 2000; // ms to charge before explosion
+const HOLLOW_NUKE_WINDOW      = 10000; // ms window to fire red into blue
+let hollowNukeOrb = null; // {x, y, timer, charged, chargeTimer, owner}
+let purpleFlash   = 0;    // screen flash on nuke explosion
+
+function tickHollowNuke(dt, p1, p2){
+  if(!hollowNukeOrb) return;
+  const n = hollowNukeOrb;
+  n.timer -= dt;
+  if(n.timer <= 0 && !n.charged){ hollowNukeOrb=null; return; }
+  if(n.charged){
+    n.chargeTimer -= dt;
+    // Pulse the orb
+    n.pulse = (n.pulse||0) + dt*0.01;
+    if(n.chargeTimer <= 0){
+      // EXPLODE — half HP to enemy
+      const def = n.owner===p1 ? p2 : p1;
+      const dmg = Math.ceil(def.maxHp * 0.5);
+      def.hp = Math.max(0, def.hp - dmg);
+      def.flash = 800;
+      addHollowExplosion(n.x, n.y);
+      addParts(n.x, n.y, '#c060ff', 30, 8);
+      addRing(n.x, n.y, '#c060ff', 180);
+      addDmg(n.x, n.y-30, dmg, '#e0a0ff');
+      doShake(25);
+      purpleFlash = 700;
+      if(def.hp<=0){ def._initRd(0,-8,0.15); def.ss(S.DEAD); }
+      else { def._initRd(0,-10,0.14); def.ss(S.RAGD, RAGD_MS*2); }
+      hollowNukeOrb = null;
+    }
+  }
+}
+function drawHollowNuke(t){
+  if(!hollowNukeOrb) return;
+  const n = hollowNukeOrb;
+  ctx.save();
+  if(n.charged){
+    // Large pulsing purple charged ball
+    const pulse = 1 + 0.15*Math.sin((n.pulse||0)*3);
+    const r = 36*pulse;
+    const prog = 1 - n.chargeTimer/HOLLOW_NUKE_CHARGE_TIME;
+    // Outer glow
+    ctx.globalAlpha = 0.5;
+    const og = ctx.createRadialGradient(n.x,n.y,0,n.x,n.y,r*2.5);
+    og.addColorStop(0,'rgba(200,80,255,0.6)');
+    og.addColorStop(1,'rgba(100,0,200,0)');
+    ctx.fillStyle=og;
+    ctx.beginPath(); ctx.arc(n.x,n.y,r*2.5,0,Math.PI*2); ctx.fill();
+    // Core
+    ctx.globalAlpha=1;
+    const cg=ctx.createRadialGradient(n.x,n.y,0,n.x,n.y,r);
+    cg.addColorStop(0,'rgba(255,255,255,1)');
+    cg.addColorStop(0.3,'rgba(220,100,255,1)');
+    cg.addColorStop(0.7,'rgba(140,0,220,0.9)');
+    cg.addColorStop(1,'rgba(80,0,160,0)');
+    ctx.fillStyle=cg; ctx.beginPath(); ctx.arc(n.x,n.y,r,0,Math.PI*2); ctx.fill();
+    // Charge ring
+    ctx.strokeStyle=`rgba(200,100,255,0.8)`; ctx.lineWidth=3;
+    ctx.beginPath(); ctx.arc(n.x,n.y,r*1.5,0,Math.PI*2*prog); ctx.stroke();
+  } else {
+    // Hovering blue lapse orb (large, stationary)
+    const life = n.timer / HOLLOW_NUKE_WINDOW;
+    ctx.globalAlpha = life;
+    const og=ctx.createRadialGradient(n.x,n.y,0,n.x,n.y,28);
+    og.addColorStop(0,'rgba(0,0,0,1)');
+    og.addColorStop(0.55,'rgba(0,20,80,0.9)');
+    og.addColorStop(1,'rgba(0,60,200,0)');
+    ctx.fillStyle=og; ctx.beginPath(); ctx.arc(n.x,n.y,28,0,Math.PI*2); ctx.fill();
+    // Swirl arms
+    const rot=Date.now()*0.003;
+    for(let arm=0;arm<3;arm++){
+      ctx.save(); ctx.rotate(rot+arm*(Math.PI*2/3));
+      ctx.strokeStyle=`rgba(40,140,255,${life})`; ctx.lineWidth=2.5;
+      ctx.beginPath();
+      for(let t2=0;t2<=1;t2+=0.04){
+        const r2=10+t2*32,a2=-t2*2.2;
+        t2===0?ctx.moveTo(Math.cos(a2)*r2,Math.sin(a2)*r2):ctx.lineTo(Math.cos(a2)*r2,Math.sin(a2)*r2);
+      }
+      ctx.stroke(); ctx.restore();
+    }
+    ctx.strokeStyle='#4af'; ctx.lineWidth=2; ctx.globalAlpha=life*0.5;
+    ctx.beginPath(); ctx.arc(n.x,n.y,44,0,Math.PI*2); ctx.stroke();
+    // Label
+    ctx.globalAlpha=life*0.8; ctx.fillStyle='#4af';
+    ctx.font=`700 9px 'Rajdhani',sans-serif`; ctx.textAlign='center';
+    ctx.fillText('SHOOT RED HERE', n.x, n.y-50);
+    const barW=60, pct=n.timer/HOLLOW_NUKE_WINDOW;
+    ctx.fillStyle='rgba(0,0,0,0.5)'; ctx.fillRect(n.x-barW/2,n.y-42,barW,4);
+    ctx.fillStyle='#4af'; ctx.fillRect(n.x-barW/2,n.y-42,barW*pct,4);
+  }
+  ctx.restore(); ctx.globalAlpha=1;
+}
+function addHollowShot(x, y, dir, owner){
+  hollowShots.push({ x, y, dir, owner, hit:false, life:1 });
+}
+function tickHollowShots(dt){
+  for(let i=hollowShots.length-1;i>=0;i--){
+    const s=hollowShots[i];
+    s.x += s.dir * HOLLOW_SPEED * (dt/16.67);
+    // Wall hit — explode and die
+    if(s.x < 10 || s.x > W-10){
+      addHollowExplosion(s.x, s.y);
+      hollowShots.splice(i,1);
+    }
+  }
+}
+function addHollowExplosion(x, y){
+  // Purple particle burst
+  for(let i=0;i<22;i++){
+    const a=Math.random()*Math.PI*2, spd=2+Math.random()*6;
+    parts.push({x,y,vx:Math.cos(a)*spd,vy:Math.sin(a)*spd-2,
+      life:1,decay:.018+Math.random()*.018,r:3+Math.random()*7,col:'#a040ff'});
+  }
+  addRing(x,y,'#c060ff',70);
+  addRing(x,y,'#8800cc',45);
+  doShake(16);
+}
+function drawHollowShots(t){
+  for(const s of hollowShots){
+    ctx.save();
+    ctx.translate(s.x, s.y);
+    const pulse = 0.85 + 0.15*Math.sin(t*0.012);
+
+    // Outer glow
+    ctx.globalAlpha = 0.35 * pulse;
+    const outerGlow = ctx.createRadialGradient(0,0,0,0,0,HOLLOW_BALL_R*2.2);
+    outerGlow.addColorStop(0, 'rgba(180,0,255,0.7)');
+    outerGlow.addColorStop(1, 'rgba(100,0,200,0)');
+    ctx.fillStyle = outerGlow;
+    ctx.beginPath(); ctx.arc(0,0,HOLLOW_BALL_R*2.2,0,Math.PI*2); ctx.fill();
+
+    // Core ball
+    ctx.globalAlpha = 1;
+    const coreGrad = ctx.createRadialGradient(0,0,0,0,0,HOLLOW_BALL_R*pulse);
+    coreGrad.addColorStop(0,   'rgba(255,255,255,1)');
+    coreGrad.addColorStop(0.25,'rgba(220,120,255,1)');
+    coreGrad.addColorStop(0.65,'rgba(140,0,220,0.9)');
+    coreGrad.addColorStop(1,   'rgba(80,0,160,0)');
+    ctx.fillStyle = coreGrad;
+    ctx.beginPath(); ctx.arc(0,0,HOLLOW_BALL_R*pulse,0,Math.PI*2); ctx.fill();
+
+    // Pulsing ring
+    ctx.globalAlpha = (0.5 + 0.5*Math.sin(t*0.018)) * 0.8;
+    ctx.strokeStyle = '#d080ff'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(0,0,HOLLOW_BALL_R*1.4*pulse,0,Math.PI*2); ctx.stroke();
+
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
+}
+
+const DOMAIN_CHARGE_REQ = 150;  // total damage to charge domain
+const DOMAIN_HANDSIGN   = 1800; // ms hand sign before shrine rises
+const DOMAIN_SHRINE_RISE= 1200; // ms for shrine to rise
+const DOMAIN_DURATION   = 10000;// ms domain is active
+const DOMAIN_SLASH_DMG  = 5;    // damage per second (applied continuously)
+const DOMAIN_SLASH_INT  = 100;  // ms between slash mark spawns during domain
+
+// Active domain state (global — only one can be active)
+let activeDomain = null;
+// type: 'shrine' (Sukuna) or 'void' (Gojo)
+let domainFlash = 0; // 0=none, >0=fading to black then back (total 1000ms)
+
+function startDomain(owner){
+  const type = owner.type === 'sukuna' ? 'shrine' : 'void';
+  activeDomain = {
+    owner, type,
+    timer: DOMAIN_DURATION,
+    // shrine fields
+    shrineRise: 0, slashTimer: 0, slashDmgAccum: 0,
+    // void fields
+    voidRise: 0, voidRot: 0, debrisAngle: [],
+    inkSplatters: []
+  };
+  // Spawn debris angles
+  for(let i=0;i<18;i++) activeDomain.debrisAngle.push({a:Math.random()*Math.PI*2, r:60+Math.random()*55, size:2+Math.random()*6, spd:0.3+Math.random()*0.5, drift:(Math.random()-0.5)*0.015});
+  for(let i=0;i<6;i++) activeDomain.inkSplatters.push({x:(Math.random()<0.5?0:W) + (Math.random()-0.5)*80, y:Math.random()*H, r:50+Math.random()*80, side: i<3?-1:1});
+  domainFlash = 1000; // trigger fade-to-black-and-back
+}
+
+function tickDomain(dt, p1, p2){
+  if(!activeDomain) return;
+  const d = activeDomain;
+  d.timer -= dt;
+
+  if(d.type === 'shrine'){
+    d.shrineRise = Math.min(1, d.shrineRise + dt/DOMAIN_SHRINE_RISE);
+    d.slashTimer -= dt;
+    if(d.slashTimer <= 0){
+      d.slashTimer = DOMAIN_SLASH_INT;
+      if(d.shrineRise >= 0.5){
+        const count = 6 + Math.floor(Math.random()*4);
+        for(let i=0;i<count;i++){
+          const sx = 20 + Math.random()*(W-40);
+          addSlashMark(sx, 0, (Math.random()-0.5)*0.5, true);
+        }
+        const def = d.owner===p1 ? p2 : p1;
+        if(def.hittable){
+          addSlashMark(def.x+4+Math.random()*(PW-8), def.y+6+Math.random()*(PH-12), (Math.random()-0.5)*Math.PI*0.8);
+          addSlashMark(def.x+4+Math.random()*(PW-8), def.y+6+Math.random()*(PH-12), (Math.random()-0.5)*Math.PI*0.8);
+        }
+      }
+    }
+    if(d.shrineRise >= 1){
+      const def = d.owner===p1 ? p2 : p1;
+      if(def.hittable){
+        d.slashDmgAccum += DOMAIN_SLASH_DMG * (dt/1000);
+        if(d.slashDmgAccum >= 1){
+          const dmg = Math.floor(d.slashDmgAccum);
+          d.slashDmgAccum -= dmg;
+          def.hp = Math.max(0, def.hp - dmg);
+          def.flash = 80;
+          if(def.hp <= 0 && def.state !== S.DEAD){ def._initRd(0,-3,0.05); def.ss(S.DEAD); }
+        }
+      }
+    }
+  } else {
+    // GOJO VOID DOMAIN
+    d.voidRise = Math.min(1, d.voidRise + dt/DOMAIN_SHRINE_RISE);
+    d.voidRot += dt * 0.0012;
+    // Drift debris
+    for(const db of d.debrisAngle){ db.a += db.spd * (dt/1000); db.r += db.drift*dt*0.1; db.r=Math.max(40,Math.min(120,db.r)); }
+    // Keep enemy stunned the entire time
+    const def = d.owner===p1 ? p2 : p1;
+    if(d.voidRise >= 0.4 && def.hittable && def.state !== S.STUN && def.state !== S.DEAD){
+      def.vx=0; def.vy=0; def.ss(S.STUN, 800);
+    }
+    if(def.state === S.STUN) def.sTimer = 0; // keep refreshing stun
+  }
+
+  if(d.timer <= 0) activeDomain = null;
+}
+
+function drawDomain(){
+  if(!activeDomain) return;
+  if(activeDomain.type === 'shrine') drawShrineDomain();
+  else drawVoidDomain();
+}
+
+function drawVoidDomain(){
+  const d = activeDomain;
+  const rise = d.voidRise;
+  const fade = Math.min(1, d.timer/1000);
+  const cx = W/2, cy = H/2 - 20;
+  const t = Date.now();
+
+  ctx.save();
+
+  // Deep dark blue background
+  ctx.globalAlpha = rise * fade * 0.88;
+  const bgGrad = ctx.createRadialGradient(cx,cy,0,cx,cy,W*0.7);
+  bgGrad.addColorStop(0,'rgba(4,8,22,1)');
+  bgGrad.addColorStop(0.5,'rgba(2,10,28,0.95)');
+  bgGrad.addColorStop(1,'rgba(0,5,15,0.85)');
+  ctx.fillStyle=bgGrad;
+  ctx.fillRect(0,0,W,H);
+
+  ctx.globalAlpha = rise * fade;
+
+  // --- INK SPLATTERS at edges ---
+  for(const sp of d.inkSplatters){
+    ctx.save();
+    ctx.translate(sp.x, sp.y);
+    ctx.globalAlpha = rise * fade * 0.9;
+    // Main splat blob
+    ctx.fillStyle='#fff';
+    ctx.beginPath(); ctx.ellipse(0,0,sp.r*0.6,sp.r*0.4,sp.side*0.3,0,Math.PI*2); ctx.fill();
+    // Drip tendrils
+    for(let i=0;i<5;i++){
+      const ang = (i/5)*Math.PI*2 + sp.side*0.5;
+      const len = sp.r*0.3 + Math.random()*sp.r*0.4;
+      ctx.fillStyle='rgba(255,255,255,0.7)';
+      ctx.beginPath();
+      ctx.ellipse(Math.cos(ang)*len*0.6, Math.sin(ang)*len*0.4, 4+Math.random()*8, 3+Math.random()*5, ang, 0, Math.PI*2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  // --- CONCENTRIC GLOWING RINGS ---
+  const ringCount = 7;
+  for(let i=0;i<ringCount;i++){
+    const baseR = 55 + i*22;
+    const wobble = Math.sin(t*0.001*(i+1)*0.7 + i) * 3 * rise;
+    const r = (baseR + wobble) * rise;
+    const alpha = (1 - i/ringCount) * 0.65 * fade;
+    ctx.globalAlpha = alpha;
+    ctx.strokeStyle = i < 2
+      ? `rgba(160,210,240,${0.9-i*0.1})`  // inner rings brighter
+      : `rgba(80,150,200,${0.7-i*0.08})`; // outer rings dimmer
+    ctx.lineWidth = i < 2 ? 2.5 - i*0.4 : 1.5 - i*0.1;
+    ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI*2); ctx.stroke();
+  }
+
+  // --- ORBITING DEBRIS particles ---
+  ctx.globalAlpha = rise * fade;
+  for(const db of d.debrisAngle){
+    const dx = cx + Math.cos(db.a + d.voidRot)*db.r*rise;
+    const dy = cy + Math.sin(db.a + d.voidRot)*db.r*rise*0.6;
+    ctx.fillStyle='#000';
+    ctx.beginPath();
+    ctx.ellipse(dx, dy, db.size*rise, db.size*0.6*rise, db.a, 0, Math.PI*2);
+    ctx.fill();
+    // Bright edge highlight on debris
+    ctx.fillStyle='rgba(140,190,220,0.5)';
+    ctx.beginPath();
+    ctx.ellipse(dx-db.size*0.3*rise, dy-db.size*0.2*rise, db.size*0.3*rise, db.size*0.2*rise, 0, 0, Math.PI*2);
+    ctx.fill();
+  }
+
+  // --- OUTER GLOW ring halo ---
+  ctx.globalAlpha = rise * fade * 0.5;
+  const haloGrad = ctx.createRadialGradient(cx,cy,60*rise,cx,cy,180*rise);
+  haloGrad.addColorStop(0,'rgba(60,130,200,0)');
+  haloGrad.addColorStop(0.4,'rgba(60,150,220,0.35)');
+  haloGrad.addColorStop(0.7,'rgba(40,100,180,0.2)');
+  haloGrad.addColorStop(1,'rgba(0,20,60,0)');
+  ctx.fillStyle=haloGrad;
+  ctx.beginPath(); ctx.arc(cx,cy,180*rise,0,Math.PI*2); ctx.fill();
+
+  // --- BLACK VOID SPHERE center ---
+  ctx.globalAlpha = rise * fade;
+  const voidGrad = ctx.createRadialGradient(cx-8*rise,cy-8*rise,0,cx,cy,52*rise);
+  voidGrad.addColorStop(0,'rgba(0,0,0,1)');
+  voidGrad.addColorStop(0.75,'rgba(0,0,0,1)');
+  voidGrad.addColorStop(0.88,'rgba(30,60,100,0.6)');
+  voidGrad.addColorStop(1,'rgba(60,120,180,0)');
+  ctx.fillStyle=voidGrad;
+  ctx.beginPath(); ctx.arc(cx,cy,52*rise,0,Math.PI*2); ctx.fill();
+
+  // Subtle inner ring right at sphere edge
+  ctx.globalAlpha = rise * fade * 0.8;
+  ctx.strokeStyle='rgba(120,190,230,0.7)';
+  ctx.lineWidth=2;
+  ctx.beginPath(); ctx.arc(cx,cy,52*rise,0,Math.PI*2); ctx.stroke();
+
+  // Domain timer bar
+  ctx.globalAlpha = fade;
+  const barW=200,barH=5,barX=cx-barW/2,barY=8;
+  const timerPct=d.timer/DOMAIN_DURATION;
+  ctx.fillStyle='rgba(0,0,0,0.5)'; ctx.fillRect(barX,barY,barW,barH);
+  ctx.fillStyle=`rgba(80,160,220,1)`; ctx.fillRect(barX,barY,barW*timerPct,barH);
+  ctx.strokeStyle='rgba(80,150,220,0.5)'; ctx.lineWidth=1; ctx.strokeRect(barX,barY,barW,barH);
+  ctx.fillStyle='rgba(140,200,240,0.9)'; ctx.font=`700 8px 'Rajdhani',sans-serif`;
+  ctx.textAlign='center'; ctx.fillText('INFINITE VOID', cx, barY+16);
+
+  ctx.restore();
+  ctx.globalAlpha=1;
+}
+
+function drawShrineDomain(){
+  if(!activeDomain) return;
+  const d = activeDomain;
+  const rise = d.shrineRise;
+  const fade = Math.min(1, d.timer/1000);
+  const cx = W/2;
+  const baseY = GND;
+  const t = Date.now();
+
+  ctx.save();
+
+  // Dark tinted overlay
+  if(rise > 0.3){
+    ctx.globalAlpha = (rise-0.3)/0.7 * 0.22 * fade;
+    ctx.fillStyle = '#080310';
+    ctx.fillRect(0,0,W,H);
+  }
+
+  ctx.globalAlpha = rise * fade;
+
+  // ── SHRINE ──────────────────────────────────────────────
+  const sX = cx;
+  const platH = 28 * rise;   // platform height
+  const platW = 160 * rise;  // platform width
+  const platY = baseY;       // platform sits on the ground
+  // Everything above the platform is offset up by platH
+  const floorY = platY - platH;  // effective "ground" for shrine elements
+
+  const roofBot = floorY - 70*rise;
+  const roofTop = floorY - 220*rise;
+
+  // --- Platform (tiered stone) ---
+  // Bottom tier (widest)
+  ctx.fillStyle='#2a1a0a';
+  ctx.fillRect(sX - platW/2 - 14*rise, platY - platH*0.38, (platW+28*rise), platH*0.38);
+  // Middle tier
+  ctx.fillStyle='#342010';
+  ctx.fillRect(sX - platW/2, platY - platH*0.72, platW, platH*0.34);
+  // Top tier (narrowest, this is where shrine stands)
+  ctx.fillStyle='#3e2614';
+  ctx.fillRect(sX - platW/2 + 12*rise, floorY, platW - 24*rise, platH*0.28);
+  // Edge highlight
+  ctx.strokeStyle='rgba(100,60,20,0.6)'; ctx.lineWidth=1.5;
+  ctx.strokeRect(sX - platW/2 - 14*rise, platY - platH*0.38, platW+28*rise, platH*0.38);
+  ctx.strokeRect(sX - platW/2, platY - platH*0.72, platW, platH*0.34);
+  ctx.strokeRect(sX - platW/2 + 12*rise, floorY, platW - 24*rise, platH*0.28);
+
+  // --- Animal skulls scattered around platform base ---
+  const skullPositions = [-110,-84,-60,60,84,110];
+  for(let i=0;i<skullPositions.length;i++){
+    const skx = sX + skullPositions[i]*rise;
+    const sky = platY - 6*rise;
+    ctx.fillStyle='rgba(220,210,190,0.85)';
+    ctx.beginPath(); ctx.ellipse(skx,sky-6*rise,9*rise,7*rise,0,0,Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(skx,sky,5*rise,3.5*rise,0,0,Math.PI); ctx.fill();
+    ctx.strokeStyle='rgba(180,150,80,0.9)'; ctx.lineWidth=2.5*rise;
+    ctx.beginPath(); ctx.moveTo(skx-6*rise,sky-10*rise);
+    ctx.quadraticCurveTo(skx-18*rise,sky-26*rise,skx-13*rise,sky-30*rise); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(skx+6*rise,sky-10*rise);
+    ctx.quadraticCurveTo(skx+18*rise,sky-26*rise,skx+13*rise,sky-30*rise); ctx.stroke();
+  }
+
+  // --- Dark posts on sides (standing on platform) ---
+  for(const px of [sX-98, sX+98]){
+    ctx.fillStyle='#1a0828';
+    ctx.fillRect(px-5*rise, floorY-52*rise, 10*rise, 52*rise);
+    const og = ctx.createRadialGradient(px, floorY-55*rise, 0, px, floorY-55*rise, 10*rise);
+    og.addColorStop(0,'rgba(80,40,180,0.9)');
+    og.addColorStop(1,'rgba(20,5,60,0)');
+    ctx.fillStyle=og;
+    ctx.beginPath(); ctx.arc(px, floorY-55*rise, 10*rise, 0, Math.PI*2); ctx.fill();
+  }
+
+  // --- Main shrine body (red pillars, on platform) ---
+  for(const px of [sX-38, sX+24]){
+    ctx.fillStyle='#8a1010';
+    ctx.fillRect(px*rise+(1-rise)*sX, roofBot, 14*rise, floorY-roofBot);
+    ctx.strokeStyle='rgba(0,0,0,0.3)'; ctx.lineWidth=1;
+    for(let g=0;g<3;g++){
+      const gy = roofBot+(floorY-roofBot)*g/3;
+      ctx.beginPath(); ctx.moveTo(px*rise+(1-rise)*sX, gy);
+      ctx.lineTo(px*rise+(1-rise)*sX+14*rise, gy); ctx.stroke();
+    }
+  }
+
+  // --- UPPER MOUTH / TEETH (high up, attached under roof) ---
+  const upperMouthY = roofBot - 10*rise;   // hangs under roof
+  const lowerMouthY = floorY;              // bottom teeth touch the platform floor
+  const mouthW = 88*rise;
+
+  // Upper gums
+  ctx.fillStyle='rgba(210,80,100,0.92)';
+  ctx.beginPath();
+  ctx.ellipse(sX, upperMouthY, mouthW*0.5, 22*rise, 0, Math.PI, 0);
+  ctx.fill();
+  // Upper teeth
+  ctx.fillStyle='rgba(240,235,225,0.97)';
+  const toothCount = 8;
+  for(let i=0;i<toothCount;i++){
+    const tx = sX - mouthW*0.44 + (i+0.5)*(mouthW*0.88/toothCount);
+    const tw = mouthW*0.88/toothCount*0.72;
+    const th = 30*rise * (i===0||i===toothCount-1 ? 0.55 : 1);
+    ctx.beginPath();
+    ctx.moveTo(tx-tw/2, upperMouthY);
+    ctx.lineTo(tx-tw/2+2, upperMouthY+th);
+    ctx.lineTo(tx+tw/2-2, upperMouthY+th);
+    ctx.lineTo(tx+tw/2, upperMouthY);
+    ctx.closePath(); ctx.fill();
+    ctx.strokeStyle='rgba(180,170,155,0.4)'; ctx.lineWidth=0.8; ctx.stroke();
+  }
+
+  // Inner glow between teeth sets (cyan like the anime)
+  const innerGlow = ctx.createLinearGradient(0, upperMouthY+30*rise, 0, lowerMouthY-30*rise);
+  innerGlow.addColorStop(0,'rgba(60,200,210,0.7)');
+  innerGlow.addColorStop(0.5,'rgba(40,180,200,0.4)');
+  innerGlow.addColorStop(1,'rgba(60,200,210,0.7)');
+  ctx.fillStyle=innerGlow;
+  ctx.fillRect(sX-mouthW*0.45, upperMouthY+28*rise, mouthW*0.9, lowerMouthY-upperMouthY-58*rise);
+
+  // Lower gums — touching the floor
+  ctx.fillStyle='rgba(210,80,100,0.92)';
+  ctx.beginPath();
+  ctx.ellipse(sX, lowerMouthY, mouthW*0.5, 22*rise, 0, 0, Math.PI);
+  ctx.fill();
+  // Lower teeth pointing UP from floor
+  ctx.fillStyle='rgba(240,235,225,0.97)';
+  for(let i=0;i<toothCount-1;i++){
+    const tx = sX - mouthW*0.38 + (i+0.5)*(mouthW*0.76/(toothCount-1));
+    const tw = mouthW*0.76/(toothCount-1)*0.68;
+    const th = 26*rise * (i===0||i===toothCount-2 ? 0.5 : 1);
+    ctx.beginPath();
+    ctx.moveTo(tx-tw/2, lowerMouthY);
+    ctx.lineTo(tx-tw/2+1.5, lowerMouthY-th);
+    ctx.lineTo(tx+tw/2-1.5, lowerMouthY-th);
+    ctx.lineTo(tx+tw/2, lowerMouthY);
+    ctx.closePath(); ctx.fill();
+    ctx.strokeStyle='rgba(180,170,155,0.4)'; ctx.lineWidth=0.8; ctx.stroke();
+  }
+
+  // --- Roof (dark tiled Japanese-style) ---
+  ctx.fillStyle='#2a2838';
+  ctx.beginPath();
+  ctx.moveTo(sX-92*rise, roofBot);
+  ctx.lineTo(sX+92*rise, roofBot);
+  ctx.lineTo(sX+75*rise, roofTop+25*rise);
+  ctx.lineTo(sX, roofTop);
+  ctx.lineTo(sX-75*rise, roofTop+25*rise);
+  ctx.closePath(); ctx.fill();
+  ctx.strokeStyle='rgba(50,45,65,1)'; ctx.lineWidth=1.5;
+  for(let row=0;row<6;row++){
+    const ry = roofBot - (roofBot-roofTop)*row/6;
+    const hw = 92*rise*(1-row*0.16);
+    ctx.beginPath(); ctx.moveTo(sX-hw, ry); ctx.lineTo(sX+hw, ry); ctx.stroke();
+  }
+  ctx.fillStyle='#3d2a10';
+  ctx.fillRect(sX-94*rise, roofBot-5*rise, 188*rise, 5*rise);
+
+  // --- BLADE/CLAW spikes erupting from roof ---
+  const bladeColor = '#7ab8c8';
+  const bladePositions = [
+    {x:sX,         y:roofTop,         h:72, ang:0},
+    {x:sX-36*rise, y:roofTop+16*rise, h:55, ang:-0.28},
+    {x:sX+36*rise, y:roofTop+16*rise, h:55, ang:0.28},
+    {x:sX-64*rise, y:roofBot-28*rise, h:42, ang:-0.5},
+    {x:sX+64*rise, y:roofBot-28*rise, h:42, ang:0.5},
+    {x:sX-82*rise, y:roofBot-8*rise,  h:28, ang:-0.72},
+    {x:sX+82*rise, y:roofBot-8*rise,  h:28, ang:0.72},
+    {x:sX-50*rise, y:roofTop+38*rise, h:35, ang:-0.18},
+    {x:sX+50*rise, y:roofTop+38*rise, h:35, ang:0.18},
+  ];
+  for(const b of bladePositions){
+    ctx.save();
+    ctx.translate(b.x, b.y);
+    ctx.rotate(b.ang);
+    const bh = b.h * rise;
+    const bw = bh * 0.22;
+    ctx.fillStyle = bladeColor;
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.quadraticCurveTo(-bw*1.5, -bh*0.5, -bw*0.3, -bh);
+    ctx.quadraticCurveTo(bw*0.3, -bh*0.7, bw*0.5, -bh*0.3);
+    ctx.quadraticCurveTo(bw*0.8, 0, 0, 0);
+    ctx.closePath(); ctx.fill();
+    ctx.fillStyle='rgba(180,220,235,0.5)';
+    ctx.beginPath();
+    ctx.moveTo(-bw*0.1, -bh*0.1);
+    ctx.quadraticCurveTo(-bw*0.8, -bh*0.5, -bw*0.2, -bh*0.85);
+    ctx.quadraticCurveTo(0, -bh*0.6, bw*0.1, -bh*0.2);
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+
+  // --- Skull on roof peak ---
+  ctx.fillStyle='rgba(220,215,200,0.9)';
+  ctx.beginPath(); ctx.ellipse(sX, roofTop-10*rise, 10*rise, 9*rise, 0, 0, Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(sX, roofTop-3*rise, 6*rise, 4*rise, 0, 0, Math.PI); ctx.fill();
+
+  // --- Eerie glow ---
+  ctx.globalAlpha = rise*0.22*fade*(0.6+0.4*Math.sin(t*0.002));
+  const shrGlow = ctx.createRadialGradient(sX, floorY-80*rise, 10, sX, floorY-80*rise, 130*rise);
+  shrGlow.addColorStop(0,'rgba(100,40,200,0.4)');
+  shrGlow.addColorStop(1,'rgba(100,40,200,0)');
+  ctx.fillStyle=shrGlow;
+  ctx.fillRect(sX-140*rise, floorY-220*rise, 280*rise, 220*rise);
+
+  // Domain timer bar
+  ctx.globalAlpha = fade;
+  const barW=200, barH=5, barX=cx-barW/2, barY=8;
+  const timerPct = d.timer/DOMAIN_DURATION;
+  ctx.fillStyle='rgba(0,0,0,0.5)'; ctx.fillRect(barX,barY,barW,barH);
+  ctx.fillStyle=`hsl(${20+timerPct*20},100%,50%)`;
+  ctx.fillRect(barX,barY,barW*timerPct,barH);
+  ctx.strokeStyle='rgba(200,100,0,0.4)'; ctx.lineWidth=1; ctx.strokeRect(barX,barY,barW,barH);
+  ctx.fillStyle='rgba(200,150,100,0.85)'; ctx.font=`700 8px 'Rajdhani',sans-serif`;
+  ctx.textAlign='center'; ctx.fillText('MALEVOLENT SHRINE', cx, barY+16);
+
+  ctx.restore();
+  ctx.globalAlpha=1;
+}
+
+const DISMANTLE_RANGE     = 17 * BLOCK; // 163.2 px
+const DISMANTLE_SLASH_N   = 6;      // number of slash marks
+const DISMANTLE_SLASH_INT = 130;    // ms between slash marks
+const DISMANTLE_DELAY     = 1000;   // ms before first slash mark appears
+const DISMANTLE_CAST      = DISMANTLE_DELAY + DISMANTLE_SLASH_N * DISMANTLE_SLASH_INT + 200; // arm stays raised through all slashes
+const DISMANTLE_STUN      = DISMANTLE_CAST + 100; // enemy stunned for full cast duration
+const DISMANTLE_SLASH_DMG = 5;      // 5 × 6 = 30 total damage
+const DISMANTLE_COOLDOWN  = 5000;
+
+// Slash marks (body hits for Dismantle)
+const slashMarks = [];
+function addSlashMark(x, y, angle, domain=false){
+  slashMarks.push({ x, y, angle, life: 1, domain: !!domain });
+}
+function tickSlashMarks(dt){
+  for(let i=slashMarks.length-1;i>=0;i--){
+    slashMarks[i].life -= dt * (slashMarks[i].domain ? 0.0015 : 0.0022);
+    if(slashMarks[i].life <= 0) slashMarks.splice(i,1);
+  }
+}
+function drawSlashMarks(){
+  for(const m of slashMarks){
+    ctx.save();
+    if(m.domain){
+      // Full arena-height slash with curved, swept ends
+      ctx.globalAlpha = m.life * 0.9;
+      ctx.save();
+      ctx.translate(m.x, H/2);
+      ctx.rotate(m.angle);
+
+      const slashH = H * 1.15;
+      const curlAmt = 18 + Math.abs(m.x - W/2) * 0.04; // more curl near edges
+
+      // Main slash stroke — curves inward at top and bottom
+      ctx.strokeStyle = '#fff';
+      ctx.lineWidth = 2.8 * m.life;
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      ctx.moveTo(-curlAmt, -slashH/2);          // top tip curves left
+      ctx.bezierCurveTo(
+        -curlAmt*0.3, -slashH*0.25,             // ease out
+         curlAmt*0.3,  slashH*0.25,             // ease in
+         curlAmt,      slashH/2                 // bottom tip curves right
+      );
+      ctx.stroke();
+
+      // Bright core streak (thinner, brighter)
+      ctx.strokeStyle = `rgba(255,255,255,${m.life * 0.6})`;
+      ctx.lineWidth = 1.2 * m.life;
+      ctx.beginPath();
+      ctx.moveTo(-curlAmt*0.5 - 3, -slashH/2 + 10);
+      ctx.bezierCurveTo(
+        -curlAmt*0.1 - 3, -slashH*0.2,
+         curlAmt*0.1 - 3,  slashH*0.2,
+         curlAmt*0.5 - 3,  slashH/2 - 10
+      );
+      ctx.stroke();
+
+      // Faint glow echo
+      ctx.strokeStyle = `rgba(200,220,255,${m.life * 0.18})`;
+      ctx.lineWidth = 8 * m.life;
+      ctx.beginPath();
+      ctx.moveTo(-curlAmt, -slashH/2);
+      ctx.bezierCurveTo(-curlAmt*0.3, -slashH*0.25, curlAmt*0.3, slashH*0.25, curlAmt, slashH/2);
+      ctx.stroke();
+
+      ctx.restore();
+    } else {
+      // Normal short slash mark (dismantle etc.)
+      ctx.globalAlpha = m.life;
+      ctx.translate(m.x, m.y);
+      ctx.rotate(m.angle);
+      const len = 30 + (1 - m.life) * 10;
+      const curl = 7;
+      ctx.strokeStyle = '#fff';
+      ctx.lineWidth = 2.2 * m.life;
+      ctx.beginPath();
+      ctx.moveTo(-len/2, 0);
+      ctx.bezierCurveTo(-len/4, -curl, len/4, -curl, len/2, 0);
+      ctx.stroke();
+      ctx.globalAlpha = m.life * 0.35;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(-len/2 + 2, -4);
+      ctx.bezierCurveTo(-len/4 + 2, -curl - 4, len/4 + 2, -curl - 4, len/2 + 2, -4);
+      ctx.stroke();
+    }
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
+}
+
+// Scheduled dismantle events
+const dismantleEvents = [];
+function scheduleDismantleSlashes(target, caster){
+  for(let i=0;i<DISMANTLE_SLASH_N;i++){
+    dismantleEvents.push({
+      delay: DISMANTLE_DELAY + i * DISMANTLE_SLASH_INT,
+      target, caster,
+      fired: false
+    });
+  }
+}
+function tickDismantleEvents(dt){
+  for(let i=dismantleEvents.length-1;i>=0;i--){
+    const e = dismantleEvents[i];
+    e.delay -= dt;
+    if(e.delay <= 0 && !e.fired){
+      e.fired = true;
+      if(e.target.state !== S.DEAD){
+        // random position on body
+        const bx = e.target.x + 4 + Math.random() * (PW - 8);
+        const by = e.target.y + 6 + Math.random() * (PH - 12);
+        const angle = (Math.random() - 0.5) * Math.PI * 0.7;
+        addSlashMark(bx, by, angle);
+        addParts(bx, by, '#ddd', 4, 2);
+        e.target.hp = Math.max(0, e.target.hp - DISMANTLE_SLASH_DMG);
+        e.target.flash = 120;
+        addDmg(bx, by - 10, DISMANTLE_SLASH_DMG, '#eee');
+        doShake(3);
+        // Charge caster's fuga
+        if(e.caster && e.caster.type==='sukuna')
+          e.caster.fugaCharge = Math.min(FUGA_CHARGE_REQ, e.caster.fugaCharge + DISMANTLE_SLASH_DMG);
+        if(e.caster) e.caster.domainCharge = Math.min(DOMAIN_CHARGE_REQ, e.caster.domainCharge + DISMANTLE_SLASH_DMG);
+        if(e.target.hp <= 0){
+          e.target._initRd(0, -3, 0.06);
+          e.target.ss(S.DEAD);
+        }
+      }
+      dismantleEvents.splice(i,1);
+    }
+  }
+}
+
+// Cleave projectiles
+const cleaves = [];
+const CLEAVE_WINDUP   = 520;   // ms before slice fires
+const CLEAVE_SPEED    = 11;
+const CLEAVE_DMG      = 18;
+const CLEAVE_COOLDOWN = 3500;
+const AIR_CLEAVE_AIM  = 1000;  // ms to aim during air variant
+const AIR_CLEAVE_AIM_SPEED = Math.PI / 1400; // rad per ms when holding key
+function addCleave(x, y, dir, owner, angle=0){
+  const spd = CLEAVE_SPEED;
+  cleaves.push({ x, y, dir, owner, w: 90, h: 14, life: 1, hit: false,
+                 angle,
+                 vx: Math.cos(angle) * spd * dir,
+                 vy: Math.sin(angle) * spd });
+}
+function tickCleaves(dt){
+  for(let i=cleaves.length-1;i>=0;i--){
+    const c=cleaves[i];
+    const f=dt/16.67;
+    c.x += c.vx * f;
+    c.y += c.vy * f;
+    if(c.x<-180||c.x>W+180||c.y<-180||c.y>H+180) cleaves.splice(i,1);
+  }
+}
+function drawCleaves(){
+  for(const c of cleaves){
+    ctx.save();
+    ctx.globalAlpha = 1;
+
+    const d = c.dir;
+    // Translate to the cleave centre, rotate by angle, then draw in local space
+    ctx.translate(c.x, c.y);
+    ctx.rotate(c.angle);
+
+    const cx2 = -d * 28;
+    const cy2 = 14;
+    const Rmid = 42;
+    const halfThickMax = 3.43;
+    const halfThickTip = 1;
+
+    const aMid   = d===1 ? 0 : Math.PI;
+    const aSpan  = Math.PI / 2;
+    const STEPS  = 48;
+
+    const outerPts = [];
+    const innerPts = [];
+    for(let i=0;i<=STEPS;i++){
+      const t  = i/STEPS;
+      const a  = (aMid - aSpan) + t * aSpan*2;
+      const env = Math.sin(t * Math.PI);
+      const thick = halfThickTip + (halfThickMax - halfThickTip) * env;
+      const rOut = Rmid + thick;
+      const rIn  = Rmid - thick;
+      outerPts.push([cx2 + Math.cos(a)*rOut, cy2 + Math.sin(a)*rOut]);
+      innerPts.push([cx2 + Math.cos(a)*rIn,  cy2 + Math.sin(a)*rIn]);
+    }
+
+    ctx.beginPath();
+    ctx.moveTo(outerPts[0][0], outerPts[0][1]);
+    for(let i=1;i<=STEPS;i++) ctx.lineTo(outerPts[i][0], outerPts[i][1]);
+    for(let i=STEPS;i>=0;i--) ctx.lineTo(innerPts[i][0], innerPts[i][1]);
+    ctx.closePath();
+
+    ctx.fillStyle = 'rgba(255,255,255,1)';
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,1)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    // Motion trail
+    for(let t=1;t<=2;t++){
+      ctx.globalAlpha = 0.12 - t*0.04;
+      ctx.beginPath();
+      for(let i=0;i<=STEPS;i++){
+        const a   = (aMid - aSpan) + (i/STEPS)*aSpan*2;
+        const env = Math.sin((i/STEPS)*Math.PI);
+        const rT  = Rmid - t*5 + (halfThickMax*0.5)*env;
+        const px  = cx2 - d*t*10 + Math.cos(a)*rT;
+        const py  = cy2 + t*2   + Math.sin(a)*rT;
+        i===0 ? ctx.moveTo(px,py) : ctx.lineTo(px,py);
+      }
+      ctx.strokeStyle='rgba(255,255,255,1)';
+      ctx.lineWidth = 2.5 - t*0.8;
+      ctx.stroke();
+    }
+
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
+}
+
+const keys = {};
+addEventListener('keydown', e => { keys[e.code] = true;  e.preventDefault(); }, true);
+addEventListener('keyup',   e => { keys[e.code] = false; }, true);
+
+// Inject USE ABILITY button (G) — P1
+(function(){
+  const btn = document.createElement('button');
+  btn.id = 'abilityBtn';
+  btn.textContent = 'USE ABILITY [G]';
+  btn.style.cssText = `
+    position:fixed; bottom:18px; left:18px;
+    background:rgba(30,30,30,0.55); border:2px solid rgba(200,200,200,0.45);
+    color:#ddd; font-family:'Rajdhani',sans-serif; font-weight:700; font-size:15px;
+    padding:8px 22px; border-radius:4px; cursor:pointer; z-index:10;
+    letter-spacing:2px; pointer-events:auto;
+  `;
+  document.body.appendChild(btn);
+  btn.addEventListener('mousedown', ()=>{ keys['KeyG']=true; });
+  btn.addEventListener('mouseup',   ()=>{ keys['KeyG']=false; });
+  btn.addEventListener('touchstart', e=>{ e.preventDefault(); keys['KeyG']=true; });
+  btn.addEventListener('touchend',   e=>{ e.preventDefault(); keys['KeyG']=false; });
+})();
+
+// Inject NEXT ABILITY button (H) — P1
+(function(){
+  const btn = document.createElement('button');
+  btn.id = 'nextAbilityBtn';
+  btn.textContent = 'NEXT [H]';
+  btn.style.cssText = `
+    position:fixed; bottom:18px; left:190px;
+    background:rgba(30,30,30,0.45); border:2px solid rgba(160,160,160,0.35);
+    color:#aaa; font-family:'Rajdhani',sans-serif; font-weight:700; font-size:15px;
+    padding:8px 18px; border-radius:4px; cursor:pointer; z-index:10;
+    letter-spacing:2px; pointer-events:auto;
+  `;
+  document.body.appendChild(btn);
+  btn.addEventListener('mousedown', ()=>{ keys['KeyH']=true; });
+  btn.addEventListener('mouseup',   ()=>{ keys['KeyH']=false; });
+  btn.addEventListener('touchstart', e=>{ e.preventDefault(); keys['KeyH']=true; });
+  btn.addEventListener('touchend',   e=>{ e.preventDefault(); keys['KeyH']=false; });
+})();
+
+// Inject ABILITY button (P) — Gojo
+(function(){
+  const btn = document.createElement('button');
+  btn.id = 'gojoAbilityBtn';
+  btn.textContent = 'USE ABILITY [P]';
+  btn.style.cssText = `
+    position:fixed; bottom:18px; right:18px;
+    background:rgba(0,20,60,0.55); border:2px solid rgba(40,140,255,0.55);
+    color:#adf; font-family:'Rajdhani',sans-serif; font-weight:700; font-size:15px;
+    padding:8px 22px; border-radius:4px; cursor:pointer; z-index:10;
+    letter-spacing:2px; pointer-events:auto;
+  `;
+  document.body.appendChild(btn);
+  btn.addEventListener('mousedown', ()=>{ keys['KeyP']=true; });
+  btn.addEventListener('mouseup',   ()=>{ keys['KeyP']=false; });
+  btn.addEventListener('touchstart', e=>{ e.preventDefault(); keys['KeyP']=true; });
+  btn.addEventListener('touchend',   e=>{ e.preventDefault(); keys['KeyP']=false; });
+})();
+
+// Inject NEXT ability button ([) — Gojo
+(function(){
+  const btn = document.createElement('button');
+  btn.id = 'gojoNextBtn';
+  btn.textContent = 'NEXT [[]';
+  btn.style.cssText = `
+    position:fixed; bottom:62px; right:18px;
+    background:rgba(0,10,30,0.45); border:2px solid rgba(40,100,200,0.35);
+    color:#88c; font-family:'Rajdhani',sans-serif; font-weight:700; font-size:15px;
+    padding:8px 18px; border-radius:4px; cursor:pointer; z-index:10;
+    letter-spacing:2px; pointer-events:auto;
+  `;
+  document.body.appendChild(btn);
+  btn.addEventListener('mousedown', ()=>{ keys['BracketLeft']=true; });
+  btn.addEventListener('mouseup',   ()=>{ keys['BracketLeft']=false; });
+  btn.addEventListener('touchstart', e=>{ e.preventDefault(); keys['BracketLeft']=true; });
+  btn.addEventListener('touchend',   e=>{ e.preventDefault(); keys['BracketLeft']=false; });
+})();
+
+// Inject DOMAIN button (Y) — Gojo
+(function(){
+  const btn = document.createElement('button');
+  btn.id = 'gojoDomainBtn';
+  btn.textContent = 'DOMAIN [Y]';
+  btn.style.cssText = `
+    position:fixed; bottom:106px; right:18px;
+    background:rgba(0,10,40,0.6); border:2px solid rgba(60,140,220,0.65);
+    color:#8cf; font-family:'Rajdhani',sans-serif; font-weight:700; font-size:15px;
+    padding:8px 22px; border-radius:4px; cursor:pointer; z-index:10;
+    letter-spacing:2px; pointer-events:auto;
+  `;
+  document.body.appendChild(btn);
+  btn.addEventListener('mousedown', ()=>{ keys['KeyY']=true; });
+  btn.addEventListener('mouseup',   ()=>{ keys['KeyY']=false; });
+  btn.addEventListener('touchstart', e=>{ e.preventDefault(); keys['KeyY']=true; });
+  btn.addEventListener('touchend',   e=>{ e.preventDefault(); keys['KeyY']=false; });
+})();
+
+// Inject DOMAIN button (T) — Sukuna
+(function(){
+  const btn = document.createElement('button');
+  btn.id = 'domainBtn';
+  btn.textContent = 'DOMAIN [T]';
+  btn.style.cssText = `
+    position:fixed; bottom:62px; left:18px;
+    background:rgba(60,10,0,0.55); border:2px solid rgba(160,60,0,0.6);
+    color:#e96; font-family:'Rajdhani',sans-serif; font-weight:700; font-size:15px;
+    padding:8px 22px; border-radius:4px; cursor:pointer; z-index:10;
+    letter-spacing:2px; pointer-events:auto;
+  `;
+  document.body.appendChild(btn);
+  btn.addEventListener('mousedown', ()=>{ keys['KeyT']=true; });
+  btn.addEventListener('mouseup',   ()=>{ keys['KeyT']=false; });
+  btn.addEventListener('touchstart', e=>{ e.preventDefault(); keys['KeyT']=true; });
+  btn.addEventListener('touchend',   e=>{ e.preventDefault(); keys['KeyT']=false; });
+})();
+let shakeMag = 0;
+const doShake = s => { shakeMag = Math.max(shakeMag, s); };
+let timeScale = 1.0;  // 1=normal, <1=slow motion
+
+// ── BLACK FLASH EFFECT ─────────────────────────────────────
+const blackFlashes = [];
+function addBlackFlash(x, y){
+  // Each flash stores fixed branch geometry so it doesn't shimmer randomly every frame
+  const branches = [];
+  for(let i=0;i<18;i++){
+    const ang = Math.random()*Math.PI*2;
+    const len = 55 + Math.random()*110;
+    const segs = [];
+    let cx2=0, cy2=0;
+    for(let s=0;s<6;s++){
+      const t=(s+1)/6;
+      cx2 = Math.cos(ang)*len*t + (Math.random()-0.5)*28;
+      cy2 = Math.sin(ang)*len*t + (Math.random()-0.5)*28;
+      segs.push({x:cx2,y:cy2});
+    }
+    branches.push({ang, len, segs, thick:1.5+Math.random()*3.5, dark:Math.random()<0.5});
+  }
+  // Sub-branches
+  const subBranches = [];
+  for(let i=0;i<12;i++){
+    const ang=Math.random()*Math.PI*2;
+    const len=25+Math.random()*55;
+    subBranches.push({ang,len,segs:[
+      {x:Math.cos(ang)*len*0.4+(Math.random()-0.5)*10, y:Math.sin(ang)*len*0.4+(Math.random()-0.5)*10},
+      {x:Math.cos(ang)*len+(Math.random()-0.5)*18,     y:Math.sin(ang)*len+(Math.random()-0.5)*18}
+    ]});
+  }
+  blackFlashes.push({ x, y, life:1, branches, subBranches });
+  blackFlashes._screenFlash = 800;
+}
+blackFlashes._screenFlash = 0;
+function tickBlackFlashes(dt){
+  if(blackFlashes._screenFlash>0) blackFlashes._screenFlash=Math.max(0,blackFlashes._screenFlash-dt);
+  for(let i=blackFlashes.length-1;i>=0;i--){
+    blackFlashes[i].life -= dt*0.00115; // slow decay — lingers longer
+    if(blackFlashes[i].life<=0) blackFlashes.splice(i,1);
+  }
+}
+function drawBlackFlashes(){
+  for(const b of blackFlashes){
+    ctx.save();
+    ctx.translate(b.x, b.y);
+    const a = b.life;
+
+    // Huge dark red/black outer glow — fills the surrounding area
+    ctx.globalAlpha = a * 0.65;
+    const outerGlow = ctx.createRadialGradient(0,0,0, 0,0,130);
+    outerGlow.addColorStop(0,  'rgba(140,0,0,0.9)');
+    outerGlow.addColorStop(0.3,'rgba(80,0,0,0.7)');
+    outerGlow.addColorStop(0.6,'rgba(30,0,0,0.4)');
+    outerGlow.addColorStop(1,  'rgba(0,0,0,0)');
+    ctx.fillStyle=outerGlow;
+    ctx.beginPath(); ctx.arc(0,0,130,0,Math.PI*2); ctx.fill();
+
+    // Primary jagged BLACK branches (thick, like cursed energy tendrils)
+    ctx.lineCap='round'; ctx.lineJoin='round';
+    for(const br of b.branches){
+      ctx.globalAlpha = a * (br.dark ? 0.95 : 0.75);
+      ctx.strokeStyle = br.dark ? '#000' : '#1a0000';
+      ctx.lineWidth = br.thick * a * 1.2;
+      ctx.beginPath(); ctx.moveTo(0,0);
+      for(const seg of br.segs) ctx.lineTo(seg.x, seg.y);
+      ctx.stroke();
+      // Red outline along each branch for depth
+      ctx.globalAlpha = a * 0.35;
+      ctx.strokeStyle = '#cc0000';
+      ctx.lineWidth = (br.thick * a * 0.4);
+      ctx.beginPath(); ctx.moveTo(0,0);
+      for(const seg of br.segs) ctx.lineTo(seg.x, seg.y);
+      ctx.stroke();
+    }
+
+    // Sub-branches (thinner, more chaotic)
+    for(const sb of b.subBranches){
+      ctx.globalAlpha = a * 0.7;
+      ctx.strokeStyle = '#000';
+      ctx.lineWidth = 1.5*a;
+      ctx.beginPath(); ctx.moveTo(0,0);
+      for(const seg of sb.segs) ctx.lineTo(seg.x,seg.y);
+      ctx.stroke();
+    }
+
+    // Dark black void core — flat black circle punched into center
+    ctx.globalAlpha = a * 0.95;
+    ctx.fillStyle = '#000';
+    ctx.beginPath(); ctx.arc(0,0,22,0,Math.PI*2); ctx.fill();
+
+    // Deep red ring around the void core
+    ctx.globalAlpha = a * 0.9;
+    ctx.strokeStyle = '#cc0000';
+    ctx.lineWidth = 4*a;
+    ctx.beginPath(); ctx.arc(0,0,22,0,Math.PI*2); ctx.stroke();
+    ctx.strokeStyle = '#ff2200';
+    ctx.lineWidth = 1.5*a;
+    ctx.beginPath(); ctx.arc(0,0,28,0,Math.PI*2); ctx.stroke();
+
+    // Bright white-red flash at the very center
+    ctx.globalAlpha = a * 0.85;
+    const core = ctx.createRadialGradient(0,0,0, 0,0,12);
+    core.addColorStop(0,  'rgba(255,255,255,1)');
+    core.addColorStop(0.3,'rgba(255,80,0,0.9)');
+    core.addColorStop(0.7,'rgba(200,0,0,0.4)');
+    core.addColorStop(1,  'rgba(0,0,0,0)');
+    ctx.fillStyle=core;
+    ctx.beginPath(); ctx.arc(0,0,12,0,Math.PI*2); ctx.fill();
+
+    ctx.restore();
+  }
+
+  // Full-screen dark flash — bright red, sudden and erratic
+  if(blackFlashes._screenFlash>0){
+    const prog=blackFlashes._screenFlash/800;
+    // Sudden harsh cutoff: bright for first 40%, then abrupt drop
+    const alpha = prog > 0.6
+      ? Math.pow((prog-0.6)/0.4, 0.3) * 1.0   // spike hard at start
+      : prog > 0.2
+      ? 0.9 + Math.sin(Date.now()*0.05)*0.1     // erratic flicker mid
+      : prog/0.2 * 0.5;                          // fade out
+    ctx.save();
+    ctx.globalAlpha = Math.min(1, alpha);
+    // Flat full-screen intense red
+    ctx.fillStyle='#440000';
+    ctx.fillRect(0,0,W,H);
+    // Bright center bloom
+    ctx.globalAlpha = Math.min(1, alpha*0.6);
+    const sg = ctx.createRadialGradient(W/2,H/2,0, W/2,H/2,W*0.55);
+    sg.addColorStop(0,  'rgba(160,0,0,1)');
+    sg.addColorStop(0.3,'rgba(100,0,0,0.7)');
+    sg.addColorStop(1,  'rgba(0,0,0,0)');
+    ctx.fillStyle=sg;
+    ctx.fillRect(0,0,W,H);
+    ctx.restore();
+  }
+  ctx.globalAlpha=1;
+}
+
+// Particles
+const parts = [];
+function addParts(x,y,col,n,pwr){
+  for(let i=0;i<n;i++){
+    const a=Math.random()*Math.PI*2, s=(.4+Math.random())*pwr;
+    parts.push({x,y,vx:Math.cos(a)*s,vy:Math.sin(a)*s-1.5,life:1,decay:.026+Math.random()*.024,r:1.5+Math.random()*2.5,col});
+  }
+}
+function tickParts(){
+  for(let i=parts.length-1;i>=0;i--){
+    const p=parts[i]; p.x+=p.vx; p.y+=p.vy; p.vy+=.13; p.life-=p.decay;
+    if(p.life<=0) parts.splice(i,1);
+  }
+}
+function drawParts(){
+  for(const p of parts){ ctx.globalAlpha=p.life*.9; ctx.fillStyle=p.col; ctx.beginPath(); ctx.arc(p.x,p.y,p.r*p.life,0,Math.PI*2); ctx.fill(); }
+  ctx.globalAlpha=1;
+}
+
+// Rings
+const rings=[];
+function addRing(x,y,col,maxR){ rings.push({x,y,col,r:4,maxR,life:1}); }
+function tickRings(){
+  for(let i=rings.length-1;i>=0;i--){
+    const r=rings[i]; r.r+=(r.maxR-r.r)*.18; r.life-=.042;
+    if(r.life<=0) rings.splice(i,1);
+  }
+}
+function drawRings(){
+  for(const r of rings){ ctx.globalAlpha=r.life*.6; ctx.strokeStyle=r.col; ctx.lineWidth=3*r.life; ctx.beginPath(); ctx.arc(r.x,r.y,r.r,0,Math.PI*2); ctx.stroke(); }
+  ctx.globalAlpha=1; ctx.lineWidth=1;
+}
+
+// Damage numbers
+const dmgNums=[];
+function addDmg(x,y,val,col){ dmgNums.push({x,y,vy:-2,val,col,life:1}); }
+function tickDmgNums(){
+  for(let i=dmgNums.length-1;i>=0;i--){
+    const d=dmgNums[i]; d.y+=d.vy; d.vy*=.88; d.life-=.018;
+    if(d.life<=0) dmgNums.splice(i,1);
+  }
+}
+function drawDmgNums(){
+  ctx.textAlign='center';
+  for(const d of dmgNums){ ctx.globalAlpha=d.life; ctx.fillStyle=d.col; ctx.font=`700 ${14+(1-d.life)*6}px 'Rajdhani',sans-serif`; ctx.fillText(`-${d.val}`,d.x,d.y); }
+  ctx.globalAlpha=1;
+}
+
+// ── PLAYER ─────────────────────────────────────────────────
+class Player {
+  constructor(cfg){
+    this.name   = cfg.name;
+    this.type   = cfg.type;
+    this.startX = cfg.x;
+    this.startF = cfg.facing;
+    this.ctrl   = cfg.ctrl;
+    this.charColor    = cfg.charColor    || '#ff6666';
+    this.charDimColor = cfg.charDimColor || '#dd3333';
+    this.playerNum    = cfg.playerNum    || 1;
+    // Ability keys derived from player number, not character type
+    this.abilityUseKey   = this.playerNum===1 ? 'KeyG'        : 'KeyP';
+    this.abilityCycleKey = this.playerNum===1 ? 'KeyH'        : 'BracketLeft';
+    this.domainKey       = this.playerNum===1 ? 'KeyT'        : 'KeyY';
+    this._init();
+  }
+
+  _init(){
+    this.x = this.startX; this.y = GND-PH;
+    this.vx=0; this.vy=0;
+    this.facing = this.startF;
+    this.hp=100; this.maxHp=100;
+    this.state=S.IDLE; this.sTimer=0; this.sDur=0;
+    this.atkPhase=0; this.atkTimer=0; this.atkHit=false; this.atkAnim=0;
+    this.combo=0; this.comboTimer=0;
+    this.onGround=true;
+    this.atkDown=false; this.jmpDown=false;
+    this.rdX=this.startX; this.rdY=GND-PH;
+    this.rdVx=0; this.rdVy=0; this.rdRot=0; this.rdAngV=0;
+    this.flash=0; this.walkT=0; this.diveVy=0;
+    // Cleave
+    this.cleaveDown=false; this.cleaveTimer=0; this.cleaveWindup=0;
+    this.cleaveCooldown=0; this.cleaveArm=0;
+    this.cleaveAir=false; this.cleaveAimAngle=0; this.cleaveAimTime=0;
+    // Dismantle
+    this.dismantleDown=false; this.dismantleCooldown=0;
+    this.dismantleOutline=0;
+    this.dismantleArm=0;
+    // Fuga
+    this.fugaWindup=0; this.fugaArm=0; this.fugaCooldown=0;
+    // Ability system
+    this.selectedAbility = 0;
+    this.abilityDown=false; this.nextAbilityDown=false;
+    this.fugaCharge=0;
+    // Gojo abilities
+    this.lapseDown=false; this.lapseCooldown=0;
+    this.reversalCooldown=0; this.reversalWindup=0; this.reversalArm=0;
+    this.reversalAir=false; this.reversalAimAngle=0; this.reversalAimTime=0;
+    this.gojoAbility=0; // 0=lapse blue, 1=reversal red, 2=hollow purple
+    this.nextGojoAbilityDown=false;
+    this.hollowCharge=0;
+    this.hollowWindup=0; this.hollowArm=0;
+    // Domain
+    if(this.domainCharge===undefined) this.domainCharge=0; // persists across rounds
+    this.domainDown=false;
+    this.domainHandsign=0;
+    this.gojoDomainDown=false;
+    // Yuji Black Flash minigame
+    this.bfActive=false; this.bfLinePos=0; this.bfLineDir=1;
+    this.bfTimer=0; this.bfGoalPos=0;
+    this.bfWon=false; this.bfWindowTimer=0;
+    this.bfStunnedEnemy=null; this.bfAtkDown=false;
+    // Yuji Black Blur
+    this.bbCooldown=0; this.bbPhase=0; this.bbTimer=0; this.bbAnimProg=0;
+    this.bbTarget=null; this.bbHitTarget=false;
+    this.bbGotBF=false; this.bbStartX=0;
+    // Yuji Piercing Blood
+    this.pbChargeTime=0; this.pbCooldown=0; this.pbDown=false;
+  }
+
+  reset(){ this._init(); }
+
+  get hittable(){ return ![S.RAGD,S.SLAM,S.DEAD].includes(this.state); }
+  get hitboxOn(){ return (this.state===S.ATCK&&this.atkPhase===1)||this.state===S.DIVE; }
+
+  atkBox(){
+    if(this.state===S.ATCK){ const hx=this.facing===1?this.x+PW:this.x-ATK_RANGE; return{x:hx,y:this.y+4,w:ATK_RANGE,h:PH-8}; }
+    if(this.state===S.DIVE) return{x:this.x-22,y:this.y+PH-28,w:PW+44,h:32};
+    return null;
+  }
+  bodyBox(){ return{x:this.x,y:this.y,w:PW,h:PH}; }
+  ss(s,dur=0){ this.state=s; this.sTimer=0; this.sDur=dur; }
+
+  update(dt,other){
+    const c=this.ctrl;
+    this.sTimer+=dt; this.comboTimer+=dt; this.flash=Math.max(0,this.flash-dt);
+    if(this.cleaveCooldown>0) this.cleaveCooldown=Math.max(0,this.cleaveCooldown-dt);
+    if(this.dismantleCooldown>0) this.dismantleCooldown=Math.max(0,this.dismantleCooldown-dt);
+    if(this.dismantleOutline>0) this.dismantleOutline=Math.max(0,this.dismantleOutline-dt);
+
+    // ── ABILITY SYSTEM (player-number keyed, not character keyed) ──
+    const useKey   = this.abilityUseKey;
+    const cycleKey = this.abilityCycleKey;
+    const domKey   = this.domainKey;
+
+    // Piercing Blood (Yuji) — hold use key to charge
+    if(this.type==='yuji'){
+      if(this.pbCooldown>0) this.pbCooldown=Math.max(0,this.pbCooldown-dt);
+      if(this.bbCooldown>0) this.bbCooldown=Math.max(0,this.bbCooldown-dt);
+      const pbKey = keys[useKey];
+      const canCharge = ![S.STUN,S.RAGD,S.SLAM,S.DEAD,S.BLACKFLASH,S.BLACKBLUR].includes(this.state) && this.pbCooldown<=0;
+      if(pbKey && canCharge){
+        this.pbChargeTime = Math.min(PB_CHARGE_MAX, this.pbChargeTime + dt);
+        this.vx = 0;
+      } else if(!pbKey && this.pbChargeTime > 0 && canCharge){
+        const dmg = this.pbChargeTime >= 2000 ? PB_DMG_3
+                  : this.pbChargeTime >= 1000 ? PB_DMG_2 : PB_DMG_1;
+        const sx = this.x + (this.facing===1 ? PW+4 : -4);
+        const sy = this.y + PH*0.32;
+        addPiercingBeam(sx, sy, this.facing, this, dmg);
+        addParts(sx, sy, '#8b0000', 8, 4);
+        doShake(4);
+        this.pbCooldown = PB_COOLDOWN;
+        this.pbChargeTime = 0;
+      }
+      // Black Blur — cycle key triggers lunge
+      const bbEdge = keys[cycleKey] && !this.nextAbilityDown;
+      if(!keys[cycleKey]) this.nextAbilityDown=false; else this.nextAbilityDown=true;
+      if(bbEdge && this.bbCooldown<=0 && ![S.STUN,S.RAGD,S.SLAM,S.DEAD,S.BLACKFLASH,S.BLACKBLUR].includes(this.state)){
+        this._startBlackBlur(other);
+      }
+    }
+
+    // Sukuna abilities
+    if(this.type==='sukuna'){
+      const useEdge  = keys[useKey]   && !this.abilityDown;
+      const nextEdge = keys[cycleKey] && !this.nextAbilityDown;
+      const domEdge  = keys[domKey]   && !this.domainDown;
+      if(!keys[useKey])   this.abilityDown=false;        else this.abilityDown=true;
+      if(!keys[cycleKey]) this.nextAbilityDown=false;    else this.nextAbilityDown=true;
+      if(!keys[domKey])   this.domainDown=false;         else this.domainDown=true;
+      if(nextEdge) this.selectedAbility=(this.selectedAbility+1)%3;
+      if(useEdge){
+        if(this.selectedAbility===0 && this.cleaveCooldown<=0) this._startCleave();
+        if(this.selectedAbility===1 && this.dismantleCooldown<=0) this._startDismantle(other);
+        if(this.selectedAbility===2 && this.fugaCharge>=FUGA_CHARGE_REQ) this._startFuga();
+      }
+      if(domEdge && this.domainCharge>=DOMAIN_CHARGE_REQ && !activeDomain) this._startDomain();
+    }
+
+    // Gojo abilities
+    if(this.type==='gojo'){
+      if(this.lapseCooldown>0)    this.lapseCooldown=Math.max(0,this.lapseCooldown-dt);
+      if(this.reversalCooldown>0) this.reversalCooldown=Math.max(0,this.reversalCooldown-dt);
+      const useEdge  = keys[useKey]   && !this.abilityDown;
+      const nextEdge = keys[cycleKey] && !this.nextGojoAbilityDown;
+      const domEdge  = keys[domKey]   && !this.gojoDomainDown;
+      if(!keys[useKey])   this.abilityDown=false;           else this.abilityDown=true;
+      if(!keys[cycleKey]) this.nextGojoAbilityDown=false;   else this.nextGojoAbilityDown=true;
+      if(!keys[domKey])   this.gojoDomainDown=false;        else this.gojoDomainDown=true;
+      if(nextEdge) this.gojoAbility=(this.gojoAbility+1)%3;
+      if(useEdge){
+        if(this.gojoAbility===0 && this.lapseCooldown<=0)      this._startLapseBlue();
+        if(this.gojoAbility===1 && this.reversalCooldown<=0)   this._startReversalRed();
+        if(this.gojoAbility===2 && this.hollowCharge>=HOLLOW_CHARGE_REQ) this._startHollowPurple();
+      }
+      if(domEdge && this.domainCharge>=DOMAIN_CHARGE_REQ && !activeDomain) this._startDomain();
+    }
+
+    const atkEdge=keys[c.atk]&&!this.atkDown;
+    const jmpEdge=keys[c.jmp]&&!this.jmpDown;
+    if(!keys[c.atk]) this.atkDown=false; else this.atkDown=true;
+    if(!keys[c.jmp]) this.jmpDown=false; else this.jmpDown=true;
+    if(this.comboTimer>COMBO_RESET) this.combo=0;
+    if(this.state===S.WALK) this.walkT+=dt*.012;
+
+    switch(this.state){
+      case S.IDLE: case S.WALK: case S.AIR:
+        if(keys[c.left]){this.vx=-SPD;this.facing=-1;}
+        else if(keys[c.right]){this.vx=SPD;this.facing=1;}
+        else{this.vx*=.7; if(Math.abs(this.vx)<.15) this.vx=0;}
+        if(jmpEdge&&this.onGround){this.vy=JUMP_V;this.onGround=false;this.jmpDown=true;}
+        if(atkEdge){this.atkDown=true;this._doAttack();}
+        this._phys(dt); break;
+      case S.ATCK: this._tickAtk(dt,atkEdge); if(this.type==='yuji') this.vx=0; this._phys(dt); break;
+      case S.DIVE: this._tickDive(dt); break;
+      case S.STUN: this.vx*=.82; this._phys(dt); if(this.sTimer>=this.sDur) this.ss(S.IDLE); break;
+      case S.RAGD: case S.SLAM: this._rdPhys(dt); if(this.sTimer>=this.sDur) this._exitRd(); break;
+      case S.DEAD: this._rdPhys(dt); break;
+      case S.CLEAVE:
+        this._tickCleave(dt,other);
+        if(!this.cleaveAir) this._phys(dt);
+        break;
+      case S.DISMANTLE: this._tickDismantle(dt); this._phys(dt); break;
+      case S.FUGA: this._tickFuga(dt); break;
+      case S.LAPSE: this._tickLapseBlue(dt); this._phys(dt); break;
+      case S.REVERSAL:
+        this._tickReversalRed(dt);
+        if(!this.reversalAir) this._phys(dt);
+        break;
+      case S.HOLLOW: this._tickHollowPurple(dt); break;
+      case S.DOMAIN: this._tickDomain(dt); break;
+      case S.BLACKFLASH: this._tickBlackFlash(dt, other); this._phys(dt); break;
+      case S.BLACKBLUR:  this._tickBlackBlur(dt, other); break;
+    }
+  }
+
+  _startDomain(){
+    if([S.STUN,S.RAGD,S.SLAM,S.DEAD,S.DOMAIN].includes(this.state)) return;
+    this.ss(S.DOMAIN);
+    this.domainHandsign = 0;
+    this.vx = 0;
+  }
+
+  _tickDomain(dt){
+    if(this.state===S.STUN){ this.domainHandsign=0; return; }
+    this.vx=0;
+    if(this.onGround) this.vy=0;
+    this.domainHandsign = Math.min(1, this.domainHandsign + dt/DOMAIN_HANDSIGN);
+    if(this.domainHandsign >= 1 && !activeDomain){
+      startDomain(this);
+      doShake(12);
+      domainFlash = 1200;
+      this.domainCharge = 0;
+      addRing(W/2, GND, '#8a3000', 120);
+      this.ss(S.IDLE);
+    }
+  }
+
+  _startHollowPurple(){
+    if([S.ATCK,S.DIVE,S.STUN,S.RAGD,S.SLAM,S.DEAD,S.LAPSE,S.REVERSAL,S.HOLLOW].includes(this.state)) return;
+    this.ss(S.HOLLOW);
+    this.hollowWindup = HOLLOW_WINDUP;
+    this.hollowArm = 0;
+    this.vx = 0;
+  }
+
+  _tickHollowPurple(dt){
+    if(this.state===S.STUN){ this.hollowArm=0; return; }
+    this.vx = 0; this.vy += 0; // freeze in place
+    if(this.onGround) this.vy = 0;
+    this.hollowWindup -= dt;
+    this.hollowArm = Math.max(0, 1 - this.hollowWindup/HOLLOW_WINDUP);
+    if(this.hollowWindup <= 0){
+      const sx = this.x + (this.facing===1 ? PW+HOLLOW_BALL_R : -HOLLOW_BALL_R);
+      const sy = this.y + PH*0.3;
+      addHollowShot(sx, sy, this.facing, this);
+      addParts(sx, sy, '#c060ff', 16, 6);
+      addRing(sx, sy, '#c060ff', 55);
+      doShake(8);
+      this.hollowArm = 0;
+      this.hollowCharge = 0;
+      this.ss(S.IDLE);
+    }
+  }
+
+  _startReversalRed(){
+    if([S.ATCK,S.DIVE,S.STUN,S.RAGD,S.SLAM,S.DEAD,S.LAPSE,S.REVERSAL].includes(this.state)) return;
+    this.ss(S.REVERSAL);
+    this.reversalArm = 0;
+    this.vx = 0;
+    if(!this.onGround){
+      // Air variant: suspend and aim
+      this.reversalAir = true;
+      this.reversalAimAngle = 0;
+      this.reversalAimTime = AIR_CLEAVE_AIM;
+      this.vy = 0;
+    } else {
+      this.reversalAir = false;
+      this.reversalWindup = REVERSAL_WINDUP;
+    }
+  }
+
+  _tickReversalRed(dt){
+    if(this.state===S.STUN){ this.reversalArm=0; this.reversalAir=false; return; }
+
+    if(this.reversalAir){
+      // Suspend in air, aim with up/down
+      this.vy = 0; this.vx = 0;
+      if(keys[this.ctrl.jmp])
+        this.reversalAimAngle = Math.max(-Math.PI*0.39, this.reversalAimAngle - AIR_CLEAVE_AIM_SPEED*dt);
+      if(this.ctrl.left==='KeyA' && keys['KeyS'])
+        this.reversalAimAngle = Math.min(Math.PI*0.39, this.reversalAimAngle + AIR_CLEAVE_AIM_SPEED*dt);
+      if(this.ctrl.left==='ArrowLeft' && keys['ArrowDown'])
+        this.reversalAimAngle = Math.min(Math.PI*0.39, this.reversalAimAngle + AIR_CLEAVE_AIM_SPEED*dt);
+      this.reversalArm = 1;
+      this.reversalAimTime -= dt;
+      if(this.reversalAimTime <= 0){
+        const sx = this.x + (this.facing===1 ? PW+6 : -6);
+        const sy = this.y + PH*0.3;
+        // Fire at aimed angle
+        const spd = REVERSAL_SPEED;
+        reversalShots.push({
+          x:sx, y:sy, dir:this.facing, owner:this,
+          hit:false,
+          vx: Math.cos(this.reversalAimAngle)*spd*this.facing,
+          vy: Math.sin(this.reversalAimAngle)*spd
+        });
+        addParts(sx, sy, '#f44', 8, 4);
+        addRing(sx, sy, '#f44', 36);
+        doShake(5);
+        this.reversalArm=0; this.reversalAir=false;
+        this.reversalCooldown=REVERSAL_COOLDOWN;
+        this.vy=2; this.ss(S.AIR);
+      }
+    } else {
+      // Ground variant
+      this.vx = 0;
+      this.reversalWindup -= dt;
+      this.reversalArm = Math.min(1, 1 - this.reversalWindup/REVERSAL_WINDUP);
+      if(this.reversalWindup <= 0){
+        const sx = this.x + (this.facing===1 ? PW+6 : -6);
+        const sy = this.y + PH*0.3;
+        addReversalShot(sx, sy, this.facing, this);
+        addParts(sx, sy, '#f44', 8, 4);
+        addRing(sx, sy, '#f44', 36);
+        doShake(5);
+        this.reversalArm=0;
+        this.reversalCooldown=REVERSAL_COOLDOWN;
+        this.ss(S.IDLE);
+      }
+    }
+  }
+
+  _startLapseBlue(){
+    if([S.ATCK,S.DIVE,S.STUN,S.RAGD,S.SLAM,S.DEAD,S.LAPSE].includes(this.state)) return;
+    // In Gojo's domain: spawn hollow nuke orb instead of regular lapse
+    if(this.type==='gojo' && activeDomain && activeDomain.owner===this && activeDomain.type==='void' && !hollowNukeOrb){
+      const ox = this.x + PW/2 + this.facing * LAPSE_SPAWN_DIST;
+      const oy = this.y + PH * 0.38;
+      hollowNukeOrb = { x:ox, y:oy, timer:HOLLOW_NUKE_WINDOW, charged:false, chargeTimer:HOLLOW_NUKE_CHARGE_TIME, owner:this, pulse:0 };
+      addRing(ox, oy, '#4af', 50); doShake(4);
+      return;
+    }
+    this.ss(S.LAPSE, LAPSE_CAST);
+    this.vx = 0;
+    const ox = this.x + PW/2 + this.facing * LAPSE_SPAWN_DIST;
+    const oy = this.y + PH * 0.38;
+    addLapseOrb(ox, oy, this);
+    addRing(ox, oy, '#4af', 40);
+    addParts(ox, oy, '#06f', 10, 4);
+    doShake(4);
+    this.lapseCooldown = LAPSE_COOLDOWN;
+  }
+
+  _tickLapseBlue(dt){
+    if(this.sTimer >= this.sDur) this.ss(S.IDLE);
+  }
+
+  _startDismantle(other){
+    if([S.ATCK,S.DIVE,S.STUN,S.RAGD,S.SLAM,S.DEAD,S.CLEAVE,S.DISMANTLE].includes(this.state)) return;
+    const dist = Math.abs((this.x + PW/2) - (other.x + PW/2));
+    if(dist > DISMANTLE_RANGE) { this.dismantleOutline = 700; return; } // too far — flash red outline
+    // Stun the enemy immediately
+    other.vx = 0;
+    other.ss(S.STUN, DISMANTLE_STUN);
+    // Schedule the slash marks
+    scheduleDismantleSlashes(other, this);
+    // Lock Sukuna briefly in cast pose
+    this.ss(S.DISMANTLE, DISMANTLE_CAST);
+    this.dismantleCooldown = DISMANTLE_COOLDOWN;
+    this.dismantleArm = 0;
+    this.vx = 0;
+    doShake(4);
+  }
+
+  _tickDismantle(dt){
+    this.dismantleArm = Math.min(1, this.sTimer / DISMANTLE_CAST);
+    if(this.sTimer >= this.sDur){ this.dismantleArm = 0; this.ss(S.IDLE); }
+  }
+
+  _startFuga(){
+    if([S.ATCK,S.DIVE,S.STUN,S.RAGD,S.SLAM,S.DEAD,S.CLEAVE,S.DISMANTLE,S.FUGA].includes(this.state)) return;
+    this.ss(S.FUGA);
+    this.fugaWindup = FUGA_WINDUP;
+    this.fugaArm = 0;
+    this.vx = 0;
+  }
+
+  _tickFuga(dt){
+    if(this.state===S.STUN) return; // cancelled by hit
+    this.vx=0;
+    if(this.fugaWindup>0){
+      this.fugaWindup -= dt;
+      this.fugaArm = Math.min(1, 1 - this.fugaWindup/FUGA_WINDUP);
+    } else {
+      // Fire
+      const sx = this.x + (this.facing===1 ? PW+10 : -10);
+      const sy = this.y + PH*0.28;
+      addFugaShot(sx, sy, this.facing, this);
+      addParts(sx, sy, '#fff', 14, 6);
+      addRing(sx, sy, '#fff', 60);
+      doShake(8);
+      this.fugaArm = 0;
+      this.fugaCharge = 0; // reset charge — need 40 more to use again
+      this.ss(S.IDLE);
+    }
+  }
+
+  _startBlackBlur(other){
+    if([S.STUN,S.RAGD,S.SLAM,S.DEAD,S.BLACKFLASH,S.BLACKBLUR].includes(this.state)) return;
+    this.ss(S.BLACKBLUR);
+    this.bbPhase = 0;      // 0=lunge, 1=punch1, 2=punch2, 3=slow+minigame, 4=kick, 5=done
+    this.bbTimer = 0;
+    this.bbTarget = other;
+    this.bbHitTarget = false;
+    this.bbGotBF = false;
+    this.bbStartX = this.x;
+    this.bfActive = false; this.bfWon = false; this.bfWindowTimer = 0;
+    this.bfAtkDown = true;
+    this.vy = 0;
+    addParts(this.x+PW/2, this.y+PH/2, '#111', 12, 6);
+  }
+
+  _tickBlackBlur(dt, other){
+    if(this.state===S.STUN || this.state===S.RAGD || this.state===S.DEAD){
+      timeScale = 1; this.bbPhase=5; return;
+    }
+    const def = this.bbTarget || other;
+    this.bbTimer += dt;
+
+    if(this.bbPhase === 0){
+      // LUNGE — dash, lean forward
+      this.bbAnimProg = Math.min(1, this.bbTimer / 200);
+      const targetX = def.x + (this.facing===1 ? 0 : PW) - (this.facing===1 ? PW+4 : 4);
+      const dist = Math.abs(this.x - this.bbStartX);
+      this.vx = this.facing * BB_LUNGE_SPD;
+      this.y = Math.max(10, Math.min(GND-PH, this.y)); // stay grounded-ish
+      // Apply gravity lightly
+      this.vy = Math.min(this.vy + 0.4, 8);
+      this.y = Math.min(GND-PH, this.y + this.vy*(dt/16.67));
+      if(this.y >= GND-PH){ this.y=GND-PH; this.vy=0; }
+      this.x += this.vx * (dt/16.67);
+      this.x = Math.max(10, Math.min(W-PW-10, this.x));
+
+      // Hit check during lunge
+      if(!this.bbHitTarget && def.hittable){
+        const myBox = {x:this.x, y:this.y, w:PW, h:PH};
+        if(overlaps(myBox, def.bodyBox())){
+          this.bbHitTarget = true;
+          this.vx = 0;
+          // Stun enemy for combo duration
+          def.vx = 0;
+          def.ss(S.STUN, BB_PUNCH1_DUR + BB_PUNCH2_DUR + BB_SLOW_DUR + BB_KICK_DUR + 300);
+          addParts(def.x+PW/2, def.y+PH/2, '#f5a623', 10, 5);
+          doShake(5);
+          this.bbPhase = 1; this.bbTimer = 0;
+          return;
+        }
+      }
+      // If lunged far enough or reached wall without hit, cancel
+      if(dist >= BB_LUNGE_DIST || this.x <= 10 || this.x >= W-PW-10){
+        this.bbPhase = 5; this.bbTimer = 0;
+      }
+
+    } else if(this.bbPhase === 1){
+      // PUNCH 1 — right jab
+      this.bbAnimProg = Math.min(1, this.bbTimer / BB_PUNCH1_DUR);
+      this.vx = 0;
+      if(this.bbTimer >= BB_PUNCH1_DUR){
+        // Deal punch 1 dmg
+        if(def.hittable){
+          def.hp = Math.max(0, def.hp - BB_DMG_HIT); def.flash=180;
+          addDmg(def.x+PW/2, def.y-12, BB_DMG_HIT, '#f5a623'); doShake(4);
+          addParts(def.x+PW/2, def.y+PH/2, '#f5a623', 6, 3);
+        }
+        this.bbPhase = 2; this.bbTimer = 0;
+      }
+
+    } else if(this.bbPhase === 2){
+      // PUNCH 2 — left hook
+      this.bbAnimProg = Math.min(1, this.bbTimer / BB_PUNCH2_DUR);
+      this.vx = 0;
+      if(this.bbTimer >= BB_PUNCH2_DUR){
+        if(def.hittable){
+          def.hp = Math.max(0, def.hp - BB_DMG_HIT); def.flash=180;
+          addDmg(def.x+PW/2, def.y-14, BB_DMG_HIT, '#f5a623'); doShake(4);
+          addParts(def.x+PW/2, def.y+PH/2, '#f5a623', 6, 3);
+        }
+        // Enter slow motion + minigame
+        timeScale = 0.18;
+        this.bbPhase = 3; this.bbTimer = 0;
+        // Start BF minigame
+        this.bfActive = true;
+        this.bfTimer = BB_SLOW_DUR * (1/0.18); // real-time ms, run on real dt
+        this.bfGoalPos = BF_BAR_W * 0.5 - BF_GOAL_W/2;
+        this.bfLinePos = 0; this.bfLineDir = 1;
+        this.bfWon = false; this.bfWindowTimer = 0;
+        this.bfAtkDown = true;
+        this.bfStunnedEnemy = def;
+      }
+
+    } else if(this.bbPhase === 3){
+      // SLOW MOTION + MINIGAME — one pass, real-time timed
+      this.vx = 0;
+      const realDt = dt / timeScale; // undo time scaling so minigame runs at real speed
+
+      const bbKey = keys[this.abilityCycleKey];
+      const bbEdge = bbKey && !this.bfAtkDown;
+      this.bfAtkDown = !!bbKey;
+
+      // Line moves left to right only — one pass, no bounce
+      this.bfLinePos += BB_LINE_SPEED * realDt * 0.12;
+
+      if(bbEdge){
+        // Goal check: expand by line half-width (1.5px) so visual overlap matches
+        const gl = this.bfGoalPos - 1.5;
+        const gr = this.bfGoalPos + BF_GOAL_W + 1.5;
+        if(this.bfLinePos >= gl && this.bfLinePos <= gr){
+          // HIT — immediately fire BF kick, skip straight to it
+          this.bbGotBF = true;
+          this.bfActive = false;
+          timeScale = 1;
+          this._executeBBKick(def);
+          return;
+        }
+      }
+
+      // Line reached end or already missed — end minigame
+      if(this.bfLinePos >= BF_BAR_W){
+        timeScale = 1;
+        this.bfActive = false;
+        this.bbPhase = 4; this.bbTimer = 0;
+      }
+
+    } else if(this.bbPhase === 4){
+      // Normal kick (minigame missed/timed out)
+      this.bbAnimProg = Math.min(1, this.bbTimer / BB_KICK_DUR);
+      this.vx = 0;
+      if(this.bbTimer >= BB_KICK_DUR){
+        this._executeBBKick(def);
+      }
+
+    } else {
+      // DONE
+      timeScale=1;
+      this.bbCooldown = BB_COOLDOWN;
+      this.bbHitTarget=false; this.bbGotBF=false;
+      this.ss(this.onGround ? S.IDLE : S.AIR);
+    }
+  }
+
+  _executeBBKick(def){
+    const kickDmg = this.bbGotBF ? BB_DMG_BF_KICK : BB_DMG_KICK;
+    if(def && (def.hittable || def.state===S.STUN)){
+      def.hp=Math.max(0,def.hp-kickDmg); def.flash=400;
+      if(this.bbGotBF){
+        addBlackFlash(def.x+PW/2, def.y+PH/2);
+        addDmg(def.x+PW/2, def.y-20, kickDmg, '#111'); doShake(18);
+        def._initRd(this.facing*12,-8,.15*this.facing); def.ss(def.hp<=0?S.DEAD:S.RAGD,RAGD_MS*1.6);
+      } else {
+        addParts(def.x+PW/2, def.y+PH/2, '#f5a623', 14, 6);
+        addRing(def.x+PW/2, def.y+PH/2, '#f5a623', 60);
+        addDmg(def.x+PW/2, def.y-18, kickDmg, '#f5a623'); doShake(10);
+        def._initRd(this.facing*9,-6,.12*this.facing); def.ss(def.hp<=0?S.DEAD:S.RAGD,RAGD_MS*1.2);
+      }
+      this.domainCharge=Math.min(DOMAIN_CHARGE_REQ,this.domainCharge+(BB_DMG_HIT*2+kickDmg));
+    }
+    this.bbPhase=5; this.bbTimer=0;
+  }
+
+  _startBlackFlashMinigame(enemy){
+    this.bfActive = true;
+    this.bfTimer = BF_MINIGAME_DUR;
+    this.bfLinePos = 0;
+    this.bfLineDir = 1;
+    this.bfGoalPos = BF_BAR_W * 0.5 - BF_GOAL_W/2; // goal in center
+    this.bfWon = false;
+    this.bfWindowTimer = 0;
+    this.bfStunnedEnemy = enemy;
+    this.bfAtkDown = true; // prevent instant re-trigger from held key
+    // keep enemy stunned for entire minigame
+    enemy.vx=0;
+    enemy.ss(S.STUN, BF_MINIGAME_DUR + BF_WINDOW + 200);
+    this.combo = 0;
+    this.ss(S.BLACKFLASH);
+  }
+
+  _tickBlackFlash(dt, other){
+    if(!this.bfActive){ this.ss(S.IDLE); return; }
+    this.vx = 0; // stay still during minigame
+
+    // Track atk button edge
+    const atkKey = keys[this.ctrl.atk];
+    const atkEdge = atkKey && !this.bfAtkDown;
+    this.bfAtkDown = !!atkKey;
+
+    if(this.bfWon){
+      // Window to press attack for black flash
+      this.bfWindowTimer -= dt;
+      if(atkEdge){
+        // BLACK FLASH!
+        this._triggerBlackFlash(other);
+        return;
+      }
+      if(this.bfWindowTimer <= 0){
+        // Missed the window
+        this.bfActive = false;
+        this.bfWon = false;
+        this.ss(S.IDLE);
+      }
+    } else {
+      // Minigame active: bounce line
+      this.bfTimer -= dt;
+      this.bfLinePos += this.bfLineDir * BF_LINE_SPEED * dt * 0.12;
+      if(this.bfLinePos >= BF_BAR_W){ this.bfLinePos = BF_BAR_W; this.bfLineDir = -1; }
+      if(this.bfLinePos <= 0){ this.bfLinePos = 0; this.bfLineDir = 1; }
+
+      if(atkEdge){
+        // Check if line is in goal zone
+        const goalL = this.bfGoalPos;
+        const goalR = this.bfGoalPos + BF_GOAL_W;
+        if(this.bfLinePos >= goalL && this.bfLinePos <= goalR){
+          // SUCCESS
+          this.bfWon = true;
+          this.bfWindowTimer = BF_WINDOW;
+          addRing(this.x+PW/2, this.y+PH/2, '#f5a623', 45);
+          doShake(4);
+        } else {
+          // MISS — stun Yuji for 1 second
+          this.bfActive = false;
+          this.bfTimer = 0;
+          if(this.bfStunnedEnemy && this.bfStunnedEnemy.state===S.STUN)
+            this.bfStunnedEnemy.ss(S.IDLE); // release enemy
+          this.ss(S.STUN, 1000);
+        }
+      }
+      if(this.bfTimer <= 0){
+        // Time ran out
+        this.bfActive = false;
+        this.ss(S.IDLE);
+      }
+    }
+  }
+
+  _triggerBlackFlash(other){
+    const def = this.bfStunnedEnemy || other;
+    this.bfActive = false; this.bfWon = false;
+    this.ss(S.IDLE);
+
+    const mx = def.x+PW/2, my = def.y+PH/2;
+    // Damage
+    def.hp = Math.max(0, def.hp - BF_DMG);
+    def.flash = 500;
+    // Black Flash visual effects
+    addBlackFlash(mx, my);
+    addDmg(mx, def.y-24, BF_DMG, '#111');
+    doShake(18);
+    if(def.hp<=0){ def._initRd(this.facing*11,-7,.14*this.facing); def.ss(S.DEAD); }
+    else { def._initRd(this.facing*10,-6,.13*this.facing); def.ss(S.RAGD, RAGD_MS*1.4); }
+    this.domainCharge = Math.min(DOMAIN_CHARGE_REQ, this.domainCharge+BF_DMG);
+  }
+
+  _drawBlackFlashMinigame(){
+    if(!this.bfActive) return;
+    const bx = this.x + PW/2 - BF_BAR_W/2;
+    const by = this.y - 44;
+    const t = Date.now();
+    const isBlackBlur = this.state === S.BLACKBLUR;
+    const keyHint = isBlackBlur
+      ? (this.playerNum===1 ? 'H' : '[')
+      : (this.playerNum===1 ? 'F' : ';');
+
+    ctx.save();
+    if(this.bfWon && this.state !== S.BLACKBLUR){
+      // Standalone BF: flash HIT NOW
+      const pulse = 0.7 + 0.3*Math.sin(t*0.03);
+      ctx.globalAlpha = pulse;
+      ctx.fillStyle = '#f5a623';
+      ctx.font = `700 14px 'Rajdhani',sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.fillText(`[${keyHint}] HIT NOW!`, this.x+PW/2, by-6);
+      ctx.globalAlpha = 1;
+    } else {
+      // Background
+      ctx.fillStyle = 'rgba(0,0,0,0.65)';
+      ctx.fillRect(bx-3, by-3, BF_BAR_W+6, 18);
+      // Goal zone (bright orange)
+      ctx.fillStyle = '#f5a623';
+      ctx.fillRect(bx + this.bfGoalPos, by, BF_GOAL_W, 12);
+      // Moving line (white)
+      ctx.fillStyle = '#fff';
+      ctx.fillRect(bx + this.bfLinePos - 1.5, by-2, 3, 16);
+      // Border
+      ctx.strokeStyle = 'rgba(245,166,35,0.6)'; ctx.lineWidth=1;
+      ctx.strokeRect(bx, by, BF_BAR_W, 12);
+      // Label
+      ctx.fillStyle='rgba(245,166,35,0.8)';
+      ctx.font=`700 9px 'Rajdhani',sans-serif`; ctx.textAlign='center';
+      ctx.fillText(`BLACK FLASH  [${keyHint}]`, this.x+PW/2, by-4);
+    }
+    ctx.restore();
+    ctx.globalAlpha=1;
+  }
+
+  _startBlackFlash(){ /* placeholder */ }
+
+  _startCleave(){
+    if([S.ATCK,S.DIVE,S.STUN,S.RAGD,S.SLAM,S.DEAD,S.CLEAVE].includes(this.state)) return;
+    this.ss(S.CLEAVE);
+    this.cleaveArm = 0;
+    this.vx = 0;
+    if(!this.onGround){
+      // Air variant: suspend and aim
+      this.cleaveAir = true;
+      this.cleaveAimAngle = 0;
+      this.cleaveAimTime = AIR_CLEAVE_AIM;
+      this.vy = 0; // suspend
+    } else {
+      this.cleaveAir = false;
+      this.cleaveWindup = CLEAVE_WINDUP;
+    }
+  }
+
+  _tickCleave(dt, other){
+    // If hit during any cleave state → cancel
+    if(this.state === S.STUN){ this.cleaveArm=0; this.cleaveCooldown=0; return; }
+
+    if(this.cleaveAir){
+      // ── AIR VARIANT ──
+      // Keep suspended
+      this.vy = 0; this.vx = 0;
+
+      // Aim with up/down keys — clamp to ±70°
+      const ctrl = this.ctrl;
+      if(keys[ctrl.jmp])  this.cleaveAimAngle = Math.max(-Math.PI*0.39, this.cleaveAimAngle - AIR_CLEAVE_AIM_SPEED*dt);
+      if(keys[ctrl.left] === false && keys[ctrl.right] === false && keys['ArrowDown'])
+        this.cleaveAimAngle = Math.min(Math.PI*0.39, this.cleaveAimAngle + AIR_CLEAVE_AIM_SPEED*dt);
+      // P1 uses S for down, P2 uses ArrowDown
+      if(this.ctrl.left==='KeyA' && keys['KeyS'])
+        this.cleaveAimAngle = Math.min(Math.PI*0.39, this.cleaveAimAngle + AIR_CLEAVE_AIM_SPEED*dt);
+      if(this.ctrl.left==='ArrowLeft' && keys['ArrowDown'])
+        this.cleaveAimAngle = Math.min(Math.PI*0.39, this.cleaveAimAngle + AIR_CLEAVE_AIM_SPEED*dt);
+
+      // Arm tracks aim angle
+      this.cleaveArm = 1;
+
+      this.cleaveAimTime -= dt;
+      if(this.cleaveAimTime <= 0){
+        // Fire at aimed angle
+        const sx = this.x + (this.facing===1 ? PW+8 : -8);
+        const sy = this.y + PH*0.32;
+        addCleave(sx, sy, this.facing, this, this.cleaveAimAngle);
+        addParts(sx, sy, '#ddd', 10, 5);
+        addRing(sx, sy, '#fff', 48);
+        doShake(5);
+        this.cleaveArm = 0;
+        this.cleaveAir = false;
+        this.cleaveCooldown = CLEAVE_COOLDOWN;
+        // Resume falling
+        this.vy = 2;
+        this.ss(S.AIR);
+      }
+    } else {
+      // ── GROUND VARIANT ──
+      if(this.cleaveWindup > 0){
+        this.cleaveWindup -= dt;
+        this.cleaveArm = Math.min(1, 1 - this.cleaveWindup / CLEAVE_WINDUP);
+      } else {
+        const sx = this.x + (this.facing===1 ? PW+8 : -8);
+        const sy = this.y + PH*0.32;
+        addCleave(sx, sy, this.facing, this, 0);
+        addParts(sx, sy, '#ddd', 10, 5);
+        addRing(sx, sy, '#fff', 48);
+        doShake(5);
+        this.cleaveArm = 0;
+        this.cleaveCooldown = CLEAVE_COOLDOWN;
+        this.ss(S.IDLE);
+      }
+    }
+  }
+
+  _doAttack(){
+    if([S.ATCK,S.DIVE,S.STUN,S.RAGD,S.SLAM,S.DEAD].includes(this.state)) return;
+    if(this.type==='yuji') this.vx=0; // Yuji stops to punch
+    if(this.combo>=3&&!this.onGround){ this.ss(S.DIVE,2000); this.diveVy=5; this.atkHit=false; }
+    else{ this.ss(S.ATCK,ATK_START+ATK_ACT+ATK_REC); this.atkPhase=0; this.atkTimer=0; this.atkHit=false; this.atkAnim=0; this._wasFinisher=(this.combo>=3); }
+  }
+
+  _tickAtk(dt,atkEdge){
+    this.atkTimer+=dt;
+    if(this.atkPhase===0&&this.atkTimer>=ATK_START){ this.atkPhase=1; this.atkTimer=0; }
+    else if(this.atkPhase===1){
+      this.atkAnim=this.atkTimer/ATK_ACT;
+      if(this.atkTimer>=ATK_ACT){ this.atkPhase=2; this.atkTimer=0; this.atkAnim=0; }
+    } else if(this.atkPhase===2&&this.atkTimer>=ATK_REC){
+      if(atkEdge){ this.atkDown=true; this.atkPhase=0; this.atkTimer=0; this.atkHit=false; this.atkAnim=0; }
+      else {
+        // If this was a finisher attempt and it missed, lose the combo
+        if(this._wasFinisher && !this.atkHit) this.combo=0;
+        this._wasFinisher=false;
+        this.ss(this.onGround?S.IDLE:S.AIR);
+      }
+    }
+  }
+
+  _tickDive(dt){
+    const f=dt/16.67;
+    this.diveVy=Math.min(this.diveVy+1.5*f,28);
+    this.y+=this.diveVy*f; this.x+=this.vx*.1*f;
+    this.x=Math.max(10,Math.min(W-PW-10,this.x));
+    if(this.y>=GND-PH){this.y=GND-PH;this.vy=-7;this.vx=0;this.onGround=false;
+      if(!this.atkHit) this.combo=0; // missed — lose finisher
+      this.ss(S.AIR);}
+    if(this.sTimer>=this.sDur){this.y=GND-PH;
+      if(!this.atkHit) this.combo=0; // timed out without hitting
+      this.ss(S.IDLE);}
+  }
+
+  _phys(dt){
+    const f=dt/16.67;
+    this.vy+=GRAV*f; this.x+=this.vx*f; this.y+=this.vy*f;
+    if(this.y>=GND-PH){this.y=GND-PH;this.vy=0;this.onGround=true;} else this.onGround=false;
+    this.x=Math.max(10,Math.min(W-PW-10,this.x));
+    if([S.IDLE,S.WALK,S.AIR].includes(this.state))
+      this.state=!this.onGround?S.AIR:Math.abs(this.vx)>.15?S.WALK:S.IDLE;
+  }
+
+  _rdPhys(dt){
+    const f=dt/16.67;
+    this.rdVy+=GRAV*f; this.rdVx*=Math.pow(.976,f);
+    this.rdX+=this.rdVx*f; this.rdY+=this.rdVy*f;
+    this.rdRot+=this.rdAngV*f; this.rdAngV*=Math.pow(.93,f);
+    if(this.rdY>=GND-PH){
+      this.rdY=GND-PH;
+      if(Math.abs(this.rdVy)>1.5){this.rdVy*=-.28;addParts(this.rdX+PW/2,GND,'#999',4,2);}
+      else this.rdVy=0;
+      this.rdVx*=.65; this.rdAngV*=.4;
+    }
+    if(this.rdX<10){this.rdX=10;this.rdVx*=-.4;}
+    if(this.rdX>W-PW-10){this.rdX=W-PW-10;this.rdVx*=-.4;}
+    this.x=this.rdX; this.y=this.rdY;
+  }
+
+  _exitRd(){
+    this.x=Math.max(10,Math.min(W-PW-10,this.rdX));
+    this.y=GND-PH; this.vx=0; this.vy=0; this.rdRot=0; this.ss(S.IDLE);
+  }
+
+  landHit(def){
+    if(this.atkHit) return;
+    this.atkHit=true; this.comboTimer=0;
+    const isSlam    =this.state===S.DIVE;
+    const isFinisher=!isSlam&&this.combo>=3;
+    const mx=def.x+PW/2, my=def.y+PH/2;
+    if(isSlam){
+      this.combo=0; def.getSlam(this);
+      addParts(mx,GND,'#aaa',20,5); addRing(mx,GND,'#aaa',80);
+      addDmg(mx,def.y-14,DMG_SLAM,'#ccc'); doShake(14); this.vy=-8;
+      if(this.type==='sukuna') this.fugaCharge=Math.min(FUGA_CHARGE_REQ,this.fugaCharge+DMG_SLAM);
+      if(this.type==='gojo')   this.hollowCharge=Math.min(HOLLOW_CHARGE_REQ,this.hollowCharge+DMG_SLAM);
+      this.domainCharge=Math.min(DOMAIN_CHARGE_REQ,this.domainCharge+DMG_SLAM);
+    } else if(isFinisher){
+      this.combo=0; def.getKnockback(this);
+      addParts(mx,my,'#aaa',14,5); addRing(mx,my,'#aaa',55);
+      addDmg(mx,def.y-14,DMG_KB,'#ccc'); doShake(8);
+      if(this.type==='sukuna') this.fugaCharge=Math.min(FUGA_CHARGE_REQ,this.fugaCharge+DMG_KB);
+      if(this.type==='gojo')   this.hollowCharge=Math.min(HOLLOW_CHARGE_REQ,this.hollowCharge+DMG_KB);
+      this.domainCharge=Math.min(DOMAIN_CHARGE_REQ,this.domainCharge+DMG_KB);
+    } else {
+      this.combo++; def.getStun(this);
+      addParts(mx,my,'#aaa',7,3); addRing(mx,my,'#888',28);
+      addDmg(mx,def.y-14,DMG_HIT,'#ccc'); doShake(3);
+      if(this.type==='sukuna') this.fugaCharge=Math.min(FUGA_CHARGE_REQ,this.fugaCharge+DMG_HIT);
+      if(this.type==='gojo')   this.hollowCharge=Math.min(HOLLOW_CHARGE_REQ,this.hollowCharge+DMG_HIT);
+      this.domainCharge=Math.min(DOMAIN_CHARGE_REQ,this.domainCharge+DMG_HIT);
+      // Yuji: 3rd hit activates Black Flash minigame
+      if(this.type==='yuji' && this.combo===3){
+        this._startBlackFlashMinigame(def);
+      }
+    }
+  }
+
+  getStun(atk){
+    // Cancel cleave windup if in progress
+    if(this.state===S.CLEAVE){ this.cleaveArm=0; this.cleaveCooldown=0; }
+    if(this.state===S.FUGA){ this.fugaArm=0; }
+    this.hp=Math.max(0,this.hp-DMG_HIT); this.flash=200;
+    if(this.hp<=0){this._initRd(atk.facing*5,-4.5,.11*atk.facing);this.ss(S.DEAD);return;}
+    this.vx=atk.facing*2; this.ss(S.STUN,STUN_MS);
+  }
+  getKnockback(atk){
+    if(this.state===S.CLEAVE){ this.cleaveArm=0; this.cleaveCooldown=0; }
+    if(this.state===S.FUGA){ this.fugaArm=0; }
+    this.hp=Math.max(0,this.hp-DMG_KB); this.flash=320;
+    if(this.hp<=0){this._initRd(atk.facing*10,-7,.13*atk.facing);this.ss(S.DEAD);return;}
+    this._initRd(atk.facing*10.5,-7,.13*atk.facing); this.ss(S.RAGD,RAGD_MS);
+  }
+  getSlam(atk){
+    this.hp=Math.max(0,this.hp-DMG_SLAM); this.flash=400;
+    if(this.hp<=0){this._initRd(atk.facing*4,-1,.05*atk.facing);this.ss(S.DEAD);return;}
+    this.x=this.rdX; this.y=this.rdY=GND-PH;
+    this._initRd(atk.facing*4,0,.05*atk.facing); this.ss(S.SLAM,SLAM_MS);
+  }
+  _initRd(vx,vy,angV){ this.rdX=this.x;this.rdY=this.y;this.rdVx=vx;this.rdVy=vy;this.rdRot=0;this.rdAngV=angV; }
+
+  draw(){
+    const phys=[S.RAGD,S.SLAM,S.DEAD].includes(this.state);
+    ctx.save();
+    if(this.flash>0) ctx.globalAlpha=.45+.55*Math.abs(Math.sin(this.flash*.055));
+    this._shadow();
+    if(phys){
+      ctx.translate(this.rdX+PW/2,this.rdY+PH/2); ctx.rotate(this.rdRot); this._stick(0,0);
+    } else if(this.state===S.DIVE){
+      ctx.translate(this.x+PW/2,this.y+PH/2); ctx.rotate(this.facing*.85); this._stick(0,0);
+    } else if(this.state===S.CLEAVE && this.cleaveAir){
+      // Body tilts to match aimed angle
+      ctx.translate(this.x+PW/2,this.y+PH/2);
+      ctx.rotate(this.cleaveAimAngle * this.facing * 0.75);
+      this._stick(0,0);
+    } else if(this.state===S.REVERSAL && this.reversalAir){
+      ctx.translate(this.x+PW/2,this.y+PH/2);
+      ctx.rotate(this.reversalAimAngle * this.facing * 0.75);
+      this._stick(0,0);
+    } else {
+      this._stick(this.x+PW/2,this.y+PH/2);
+    }
+    ctx.restore();
+
+    // Flashing red outline when dismantle is out of range
+    if(this.dismantleOutline > 0){
+      const pulse = Math.abs(Math.sin(this.dismantleOutline * 0.018));
+      ctx.save();
+      ctx.globalAlpha = pulse * 0.85;
+      ctx.strokeStyle = '#f00';
+      ctx.lineWidth = 2.5;
+      const pad = 6;
+      ctx.strokeRect(this.x - pad, this.y - pad, PW + pad*2, PH + pad*2);
+      ctx.restore();
+    }
+
+    // Yuji: red outline flash when Piercing Blood is fully charged
+    if(this.type==='yuji' && this.pbChargeTime >= PB_CHARGE_MAX){
+      const t2 = Date.now();
+      // Rapid erratic flicker — multiple sine waves at different speeds
+      const flicker = Math.abs(Math.sin(t2*0.022)) * Math.abs(Math.sin(t2*0.007+1.3)) + 0.3;
+      const pad = 7;
+      ctx.save();
+      // Outer glow
+      ctx.globalAlpha = flicker * 0.5;
+      ctx.shadowColor = '#ff0000'; ctx.shadowBlur = 22;
+      ctx.strokeStyle = '#ff0000';
+      ctx.lineWidth = 6;
+      ctx.strokeRect(this.x - pad - 2, this.y - pad - 2, PW + (pad+2)*2, PH + (pad+2)*2);
+      // Inner sharp outline
+      ctx.globalAlpha = 0.6 + flicker * 0.4;
+      ctx.shadowBlur = 8;
+      ctx.strokeStyle = '#ff4444';
+      ctx.lineWidth = 2.5;
+      ctx.strokeRect(this.x - pad, this.y - pad, PW + pad*2, PH + pad*2);
+      ctx.shadowBlur = 0;
+      ctx.restore();
+    }
+
+    // Air cleave aim indicator
+    if(this.state===S.CLEAVE && this.cleaveAir){
+      const ox = this.x + PW/2;
+      const oy = this.y + PH*0.32;
+      const ang = this.cleaveAimAngle;
+      const lineLen = 55;
+      const ex2 = ox + this.facing * Math.cos(ang) * lineLen;
+      const ey2 = oy + Math.sin(ang) * lineLen;
+      const pulse = 0.45 + 0.45 * Math.abs(Math.sin(Date.now() * 0.008));
+      ctx.save();
+      ctx.globalAlpha = pulse;
+      ctx.strokeStyle = '#fff';
+      ctx.lineWidth = 1.2;
+      ctx.setLineDash([6, 4]);
+      ctx.beginPath(); ctx.moveTo(ox, oy); ctx.lineTo(ex2, ey2); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = '#fff';
+      ctx.beginPath(); ctx.arc(ex2, ey2, 2.5, 0, Math.PI*2); ctx.fill();
+      const barW = 36;
+      const barPct = this.cleaveAimTime / AIR_CLEAVE_AIM;
+      ctx.fillStyle = 'rgba(0,0,0,0.5)';
+      ctx.fillRect(ox - barW/2, this.y - 12, barW, 4);
+      ctx.fillStyle = '#fff';
+      ctx.fillRect(ox - barW/2, this.y - 12, barW * barPct, 4);
+      ctx.restore();
+    }
+
+    // Air reversal aim indicator
+    if(this.state===S.REVERSAL && this.reversalAir){
+      const ox = this.x + PW/2;
+      const oy = this.y + PH*0.3;
+      const ang = this.reversalAimAngle;
+      const lineLen = 60;
+      const ex2 = ox + this.facing * Math.cos(ang) * lineLen;
+      const ey2 = oy + Math.sin(ang) * lineLen;
+      const pulse = 0.45 + 0.45*Math.abs(Math.sin(Date.now()*0.008));
+      ctx.save();
+      ctx.globalAlpha = pulse;
+      ctx.strokeStyle = '#f44';
+      ctx.lineWidth = 1.4;
+      ctx.setLineDash([6, 4]);
+      ctx.beginPath(); ctx.moveTo(ox, oy); ctx.lineTo(ex2, ey2); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = '#f44';
+      ctx.beginPath(); ctx.arc(ex2, ey2, 3, 0, Math.PI*2); ctx.fill();
+      const barW = 36;
+      const barPct = this.reversalAimTime / AIR_CLEAVE_AIM;
+      ctx.fillStyle = 'rgba(0,0,0,0.5)';
+      ctx.fillRect(ox - barW/2, this.y - 12, barW, 4);
+      ctx.fillStyle = '#f44';
+      ctx.fillRect(ox - barW/2, this.y - 12, barW * barPct, 4);
+      ctx.restore();
+    }
+
+    // Hollow Purple windup — two balls converge into one
+    if(this.state===S.HOLLOW){
+      const cx = this.x + PW/2;
+      const cy = this.y + PH*0.3;
+      const prog = this.hollowArm; // 0→1
+      const t = Date.now();
+
+      // Orbit radius shrinks as they converge
+      const orbitR = 50 * (1 - prog);
+      // Convergence point (in front of Gojo)
+      const targetX = cx + this.facing * 30;
+
+      // Red ball position — starts behind, orbits in
+      const redAng = -Math.PI*0.4 + prog * Math.PI*0.4;
+      const rx = cx + Math.cos(redAng) * orbitR * this.facing + this.facing * 30*prog;
+      const ry = cy + Math.sin(redAng) * orbitR * 0.5;
+
+      // Blue ball position — starts above-front, orbits in
+      const blueAng = Math.PI*0.4 - prog * Math.PI*0.4;
+      const bx2 = cx + Math.cos(blueAng) * orbitR * this.facing + this.facing * 30*prog;
+      const by2 = cy + Math.sin(blueAng) * orbitR * 0.5;
+
+      const ballR = 9 + prog * 5;
+
+      if(prog < 0.9){
+        // Draw red ball
+        ctx.save();
+        ctx.globalAlpha = 1 - prog*1.1;
+        const rg = ctx.createRadialGradient(rx,ry,0,rx,ry,ballR);
+        rg.addColorStop(0,'rgba(255,200,200,1)');
+        rg.addColorStop(0.4,'rgba(255,50,50,1)');
+        rg.addColorStop(1,'rgba(180,0,0,0)');
+        ctx.fillStyle=rg;
+        ctx.beginPath(); ctx.arc(rx,ry,ballR,0,Math.PI*2); ctx.fill();
+        ctx.restore();
+
+        // Draw blue ball
+        ctx.save();
+        ctx.globalAlpha = 1 - prog*1.1;
+        const bg2 = ctx.createRadialGradient(bx2,by2,0,bx2,by2,ballR);
+        bg2.addColorStop(0,'rgba(200,220,255,1)');
+        bg2.addColorStop(0.4,'rgba(40,120,255,1)');
+        bg2.addColorStop(1,'rgba(0,40,200,0)');
+        ctx.fillStyle=bg2;
+        ctx.beginPath(); ctx.arc(bx2,by2,ballR,0,Math.PI*2); ctx.fill();
+        ctx.restore();
+      }
+
+      // Purple merged ball grows as they converge
+      if(prog > 0.5){
+        const mergeAlpha = (prog-0.5)*2;
+        const mergeR = (prog-0.5) * HOLLOW_BALL_R * 2.2;
+        const pulse = 0.88+0.12*Math.sin(t*0.018);
+        ctx.save();
+        ctx.globalAlpha = mergeAlpha;
+        const pg = ctx.createRadialGradient(targetX,cy,0,targetX,cy,mergeR*pulse);
+        pg.addColorStop(0,'rgba(255,255,255,1)');
+        pg.addColorStop(0.3,'rgba(210,100,255,1)');
+        pg.addColorStop(0.7,'rgba(130,0,220,0.8)');
+        pg.addColorStop(1,'rgba(80,0,160,0)');
+        ctx.fillStyle=pg;
+        ctx.beginPath(); ctx.arc(targetX,cy,mergeR*pulse,0,Math.PI*2); ctx.fill();
+        // Pulsing ring
+        ctx.globalAlpha = mergeAlpha * 0.6;
+        ctx.strokeStyle='#c080ff'; ctx.lineWidth=2;
+        ctx.beginPath(); ctx.arc(targetX,cy,mergeR*1.4,0,Math.PI*2); ctx.stroke();
+        ctx.restore();
+        ctx.globalAlpha=1;
+      }
+    }
+    // Yuji Black Flash minigame overlay
+    if(this.type==='yuji') this._drawBlackFlashMinigame();
+  }
+
+  _shadow(){
+    const dist=GND-(this.y+PH), sc=Math.max(.15,1-dist/280);
+    ctx.save(); ctx.globalAlpha=.18*sc; ctx.fillStyle='#000';
+    ctx.beginPath(); ctx.ellipse(this.x+PW/2,GND+4,20*sc,5*sc,0,0,Math.PI*2); ctx.fill(); ctx.restore();
+  }
+
+  _stick(cx,cy){
+    const f      = this.facing;
+    const isAtk  = this.state===S.ATCK&&this.atkPhase===1;
+    const aa     = isAtk?this.atkAnim:0;
+    const isCleave = this.state===S.CLEAVE;
+    const ca     = isCleave ? this.cleaveArm : 0;
+    const isDismantle = this.state===S.DISMANTLE;
+    const da     = isDismantle ? this.dismantleArm : 0;
+    const isReversal = this.state===S.REVERSAL;
+    const ra     = isReversal ? this.reversalArm : 0;
+    const walking= this.state===S.WALK;
+    const wt     = this.walkT;
+    const main   = this.charColor;
+    const dim    = this.charDimColor;
+
+    const top   = -PH/2;
+    const headY = top+HEAD_R+1;
+    const neckY = headY+HEAD_R+3;
+    const hipY  = neckY+BODY_H;
+    const footY = hipY+LEG_H;
+
+    // Yuji Piercing Blood charging — crouch offset
+    const pbCharge = (this.type==='yuji') ? Math.min(1, this.pbChargeTime / PB_CHARGE_MAX) : 0;
+    const crouchY  = pbCharge * 7; // squat down
+
+    const legA = walking?Math.sin(wt)*20:0;
+    const bob  = walking?Math.abs(Math.sin(wt*2))*3:0;
+
+    ctx.lineCap='round'; ctx.lineJoin='round';
+
+    // Back leg (crouched when charging)
+    {
+      const legSwB=walking?Math.sin(wt+Math.PI)*20:0;
+      const kx=cx+f*(-6), ky=cy+hipY+11+bob+crouchY*1.5;
+      const fx=cx+f*(-6)-legSwB*f*.7, fy=cy+footY+bob;
+      ctx.strokeStyle=dim; ctx.lineWidth=LIMB_W*.85;
+      ctx.beginPath(); ctx.moveTo(cx,cy+hipY+bob+crouchY); ctx.lineTo(kx,ky); ctx.lineTo(fx,fy); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(fx,fy); ctx.lineTo(fx+f*6,fy); ctx.stroke();
+    }
+    // Back arm (folds inward when charging PB)
+    {
+      const armSwB=walking?Math.sin(wt)*12:0;
+      let ex,ey,hx,hy;
+      if(pbCharge>0){
+        // Back arm folds inward to clasp at center — mirrors front arm
+        ex=cx+f*(-10+pbCharge*13); ey=cy+neckY+8+bob+crouchY*0.5+pbCharge*6;
+        hx=cx+f*(-2 +pbCharge*4 ); hy=cy+neckY+16+bob+crouchY*0.5+pbCharge*5;
+      } else if(this.state===S.BLACKBLUR){
+        const bp=this.bbPhase, ba=this.bbAnimProg;
+        if(bp===1){
+          // Punch 1: back arm cocks back for next hit
+          const pull = ba < 0.5 ? 0 : (ba-0.5)/0.5;
+          ex=cx+f*(-10-pull*8); ey=cy+neckY+8+bob-pull*6;
+          hx=cx+f*(-16-pull*10); hy=cy+neckY+18+bob-pull*8;
+        } else if(bp===2){
+          // Punch 2: back arm (this one is the hooker) swings across
+          const punch = ba < 0.45 ? ba/0.45 : 1-(ba-0.45)/0.55;
+          const pEase = punch*(2-punch);
+          ex=cx+f*(-10+pEase*20); ey=cy+neckY+6+bob - pEase*8;
+          hx=cx+f*(-14+pEase*30); hy=cy+neckY+14+bob - pEase*12;
+        } else if(bp===3){
+          // Guard: back fist raised
+          ex=cx+f*(-6); ey=cy+neckY+4+bob;
+          hx=cx+f*(-10); hy=cy+neckY-2+bob;
+        } else if(bp===4){
+          // Kick: arms swing back for balance
+          const kick = ba*(2-ba);
+          ex=cx+f*(-8-kick*6); ey=cy+neckY+6+bob+kick*4;
+          hx=cx+f*(-14-kick*8); hy=cy+neckY+16+bob+kick*6;
+        } else {
+          ex=cx+f*(-10)-armSwB*f*.4; ey=cy+neckY+8+bob;
+          hx=cx+f*(-16)-armSwB*f*.8; hy=cy+neckY+20+bob;
+        }
+      } else {
+        ex=cx+f*(-10)-armSwB*f*.4; ey=cy+neckY+8+bob;
+        hx=cx+f*(-16)-armSwB*f*.8; hy=cy+neckY+20+bob;
+      }
+      ctx.strokeStyle=dim; ctx.lineWidth=LIMB_W*.85;
+      ctx.beginPath(); ctx.moveTo(cx,cy+neckY+bob+crouchY*0.5); ctx.lineTo(ex,ey); ctx.lineTo(hx,hy); ctx.stroke();
+    }
+    // Torso (shifts down with crouch)
+    ctx.strokeStyle=main; ctx.lineWidth=LIMB_W*1.5;
+    ctx.beginPath(); ctx.moveTo(cx,cy+neckY+bob+crouchY*0.5); ctx.lineTo(cx,cy+hipY+bob+crouchY); ctx.stroke();
+    // Front leg (crouched, or kick animation)
+    {
+      const isBBKick = this.state===S.BLACKBLUR && this.bbPhase===4;
+      const kick = isBBKick ? this.bbAnimProg*(2-this.bbAnimProg) : 0;
+      // Kick: knee raises then snaps forward
+      const kx = isBBKick ? cx+f*(6+kick*12) : cx+f*6;
+      const ky = isBBKick
+        ? cy+hipY+11+bob - kick*28     // knee comes up high
+        : cy+hipY+11+bob+crouchY*1.5;
+      const fx = isBBKick
+        ? cx+f*(8+kick*30)             // foot shoots forward
+        : cx+f*6+legA*f*.7;
+      const fy = isBBKick
+        ? cy+footY+bob - kick*12       // foot rises with kick
+        : cy+footY+bob;
+      ctx.strokeStyle=main; ctx.lineWidth=LIMB_W;
+      ctx.beginPath(); ctx.moveTo(cx,cy+hipY+bob+crouchY); ctx.lineTo(kx,ky); ctx.lineTo(fx,fy); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(fx,fy); ctx.lineTo(fx+f*6,fy); ctx.stroke();
+      // Draw fist/foot dot at kick impact point
+      if(isBBKick && kick>0.5){
+        ctx.fillStyle=main; ctx.beginPath(); ctx.arc(fx,fy,4,0,Math.PI*2); ctx.fill();
+      }
+    }
+    // Front arm (punch / cleave raise)
+    {
+      let ex,ey,hx,hy;
+      if(isAtk){
+        if(aa<0.4){
+          const t2=aa/0.4;
+          ex=cx+f*8-f*10*t2;  ey=cy+neckY+6+bob;
+          hx=cx+f*14-f*18*t2; hy=cy+neckY+14+bob;
+        } else {
+          const t2=(aa-0.4)/0.6, ease=t2*(2-t2);
+          ex=cx+f*(-2)+f*18*ease; ey=cy+neckY+6+bob-4*ease;
+          hx=cx+f*(-4)+f*36*ease; hy=cy+neckY+14+bob-8*ease;
+        }
+      } else if(isCleave){
+        // Arm sweeps down on ground; points in aim direction during air variant
+        if(this.cleaveAir){
+          // Arm extends in the aimed direction
+          const ang = this.cleaveAimAngle;
+          const armLen1 = 14, armLen2 = 14;
+          ex = cx + f * (armLen1 * Math.cos(ang));
+          ey = cy + neckY + 10 + bob + armLen1 * Math.sin(ang);
+          hx = cx + f * ((armLen1+armLen2) * Math.cos(ang));
+          hy = cy + neckY + 10 + bob + (armLen1+armLen2) * Math.sin(ang);
+        } else {
+          const sweep = ca * 42;
+          const startRaise = 28;
+          ex=cx+f*10; ey=cy+neckY+6+bob - startRaise + sweep*0.5;
+          hx=cx+f*(14+ca*8); hy=cy+neckY+14+bob - startRaise + sweep;
+        }
+      } else if(isDismantle){
+        // Arm thrusts straight up, palm open toward enemy
+        const raise = da * 42;
+        ex=cx+f*6;          ey=cy+neckY+4+bob - raise*0.45;
+        hx=cx+f*8;          hy=cy+neckY+10+bob - raise;
+      } else if(this.state===S.FUGA){
+        // Bow draw: arm pulls back then thrusts forward
+        const fa = this.fugaArm;
+        // Pull back phase (0→0.6): hand draws backward
+        // Release (0.6→1): snaps forward fast
+        if(fa < 0.6){
+          const t2 = fa/0.6;
+          ex=cx+f*(10-t2*22); ey=cy+neckY+5+bob - t2*8;
+          hx=cx+f*(16-t2*30); hy=cy+neckY+12+bob - t2*14;
+        } else {
+          const t2=(fa-0.6)/0.4, ease=1-(1-t2)*(1-t2);
+          ex=cx+f*(-12+ease*28); ey=cy+neckY+5+bob - 8 + ease*6;
+          hx=cx+f*(-14+ease*38); hy=cy+neckY+12+bob - 14 + ease*10;
+        }
+      } else if(isReversal){
+        // Arm raises then thrusts forward to fire
+        const raise = Math.min(1, ra*2) * 28;
+        const thrust = Math.max(0, ra*2-1);
+        ex=cx+f*(8 + thrust*10); ey=cy+neckY+5+bob - raise + thrust*raise*0.6;
+        hx=cx+f*(14 + thrust*22); hy=cy+neckY+12+bob - raise + thrust*raise*0.8;
+      } else if(this.state===S.DOMAIN){
+        // Hand sign: both arms raised and clasped together in front
+        const dh = this.domainHandsign;
+        const raise = dh * 20;
+        // Front arm comes up and inward
+        ex=cx+f*(8 - dh*10); ey=cy+neckY+6+bob - raise*0.6;
+        hx=cx+f*(6 - dh*8);  hy=cy+neckY+12+bob - raise;
+      } else if(this.type==='yuji' && this.pbChargeTime > 0){
+        // Piercing Blood: front arm folds inward, hands clasp at center
+        const charge = Math.min(1, this.pbChargeTime / PB_CHARGE_MAX);
+        ex = cx + f*(10 - charge*16); ey = cy + neckY + 6 + bob + charge*8;
+        hx = cx + f*(2  - charge*3);  hy = cy + neckY + 16 + bob + charge*6;
+      } else if(this.state===S.BLACKBLUR){
+        const bp = this.bbPhase, ba = this.bbAnimProg;
+        const ease = ba*(2-ba); // ease out
+
+        if(bp===0){
+          // LUNGE: arm sweeps back, body leans
+          ex=cx+f*(8 - ease*16); ey=cy+neckY+6+bob - ease*4;
+          hx=cx+f*(12- ease*22); hy=cy+neckY+14+bob - ease*6;
+        } else if(bp===1){
+          // PUNCH 1: right jab thrusts far forward fast then retracts
+          const punch = ba < 0.45 ? ba/0.45 : 1-(ba-0.45)/0.55;
+          const pEase = punch*(2-punch);
+          ex=cx+f*(8 + pEase*18); ey=cy+neckY+5+bob - pEase*6;
+          hx=cx+f*(14+ pEase*32); hy=cy+neckY+10+bob - pEase*10;
+        } else if(bp===2){
+          // PUNCH 2: left hook — arm swings across from the other side
+          const punch = ba < 0.45 ? ba/0.45 : 1-(ba-0.45)/0.55;
+          const pEase = punch*(2-punch);
+          // Hook comes from the inside going outward
+          ex=cx+f*(6 - pEase*4) ; ey=cy+neckY+8+bob - pEase*10;
+          hx=cx+f*(10+ pEase*20); hy=cy+neckY+18+bob - pEase*16;
+        } else if(bp===3){
+          // SLOW / MINIGAME: fighting guard stance — both fists raised
+          ex=cx+f*6; ey=cy+neckY+4+bob;
+          hx=cx+f*10; hy=cy+neckY-4+bob;
+        } else {
+          // KICK (phase 4): leg swings up and snaps out
+          // Front arm swings back for balance
+          ex=cx+f*(-6); ey=cy+neckY+8+bob;
+          hx=cx+f*(-14); hy=cy+neckY+18+bob;
+        }
+      } else {
+        const armSwF=walking?Math.sin(wt+Math.PI)*12:0;
+        ex=cx+f*10+armSwF*f*.4; ey=cy+neckY+8+bob;
+        hx=cx+f*16+armSwF*f*.8; hy=cy+neckY+20+bob;
+      }
+      ctx.strokeStyle = (isCleave||isDismantle) ? `rgba(200,200,200,${0.5+(isCleave?ca:da)*0.5})` : main;
+      ctx.lineWidth=LIMB_W;
+      ctx.beginPath(); ctx.moveTo(cx,cy+neckY+bob); ctx.lineTo(ex,ey); ctx.lineTo(hx,hy); ctx.stroke();
+      if(isAtk){ ctx.fillStyle=main; ctx.beginPath(); ctx.arc(hx,hy,3.5,0,Math.PI*2); ctx.fill(); }
+      if(isCleave && ca>0.3){
+        ctx.shadowColor='#fff'; ctx.shadowBlur=14;
+        ctx.fillStyle=`rgba(220,220,220,${ca})`;
+        ctx.beginPath(); ctx.arc(hx,hy,4,0,Math.PI*2); ctx.fill();
+        ctx.shadowBlur=0;
+      }
+      if(isDismantle && da>0.2){
+        ctx.shadowColor='#88f'; ctx.shadowBlur=10;
+        ctx.fillStyle=`rgba(180,180,255,${da*0.7})`;
+        ctx.beginPath(); ctx.arc(hx,hy,3.5,0,Math.PI*2); ctx.fill();
+        ctx.shadowBlur=0;
+      }
+      if(isReversal && ra>0.2){
+        ctx.shadowColor='#f00'; ctx.shadowBlur=12;
+        ctx.fillStyle=`rgba(255,80,80,${ra})`;
+        ctx.beginPath(); ctx.arc(hx,hy,4,0,Math.PI*2); ctx.fill();
+        ctx.shadowBlur=0;
+      }
+      if(this.state===S.DOMAIN && this.domainHandsign>0.2){
+        // Dark cursed energy glow on hands
+        ctx.shadowColor='#8a3000'; ctx.shadowBlur=16;
+        ctx.fillStyle=`rgba(180,60,0,${this.domainHandsign*0.9})`;
+        ctx.beginPath(); ctx.arc(hx,hy,5,0,Math.PI*2); ctx.fill();
+        ctx.shadowBlur=0;
+      }
+    }
+    // Neck
+    ctx.strokeStyle=main; ctx.lineWidth=LIMB_W;
+    ctx.beginPath(); ctx.moveTo(cx,cy+headY+HEAD_R); ctx.lineTo(cx,cy+neckY+bob); ctx.stroke();
+    // Head
+    ctx.lineWidth=LIMB_W; ctx.strokeStyle=main; ctx.fillStyle='#ccc';
+    ctx.beginPath(); ctx.arc(cx,cy+headY+bob*.5,HEAD_R,0,Math.PI*2); ctx.fill(); ctx.stroke();
+  }
+
+  drawHUD(x,flip){
+    const y=16,bw=278,bh=20,bx=flip?x-bw:x;
+    ctx.fillStyle='rgba(0,0,0,.6)'; ctx.fillRect(bx-2,y-2,bw+4,bh+4);
+    const pct=this.hp/this.maxHp;
+    const col=pct>.5?'#888':pct>.25?'#666':'#444';
+    ctx.fillStyle=col; ctx.fillRect(flip?bx+bw-Math.floor(bw*pct):bx,y,Math.floor(bw*pct),bh);
+    ctx.strokeStyle='rgba(255,255,255,.2)'; ctx.lineWidth=1; ctx.strokeRect(bx,y,bw,bh);
+    ctx.fillStyle='#ccc'; ctx.font=`700 13px 'Rajdhani',sans-serif`;
+    ctx.textAlign=flip?'right':'left'; ctx.fillText(this.name,flip?bx+bw-5:bx+5,y+14);
+    for(let i=0;i<3;i++){
+      const px=flip?bx+bw-14-(2-i)*16:bx+14+i*16;
+      ctx.fillStyle=i<this.combo?'#ccc':'rgba(255,255,255,.1)';
+      ctx.beginPath(); ctx.arc(px,y+bh+12,5,0,Math.PI*2); ctx.fill();
+      ctx.strokeStyle='#888'; ctx.lineWidth=1; ctx.stroke();
+    }
+    if(this.combo>=3){
+      ctx.globalAlpha=.55+.45*Math.abs(Math.sin(Date.now()*.006));
+      ctx.fillStyle='#ccc'; ctx.font=`700 11px 'Rajdhani',sans-serif`;
+      ctx.textAlign=flip?'right':'left';
+      ctx.fillText('FINISHER READY',flip?bx+bw-5:bx+5,y+bh+30);
+      ctx.globalAlpha=1;
+    }
+    // Ability system HUD for Sukuna
+    if(this.type==='sukuna'){
+      const abilityNames = ['CLEAVE','DISMANTLE','FUGA'];
+      const abY = y+bh+38;
+
+      for(let i=0;i<3;i++){
+        const aw=86, gap=4;
+        const ax = flip ? bx+bw - (i+1)*(aw+gap) + gap : bx + i*(aw+gap);
+        const selected = this.selectedAbility===i;
+
+        // Cooldown/charge fill
+        let fillPct=1;
+        if(i===0) fillPct=Math.max(0,1-this.cleaveCooldown/CLEAVE_COOLDOWN);
+        if(i===1) fillPct=Math.max(0,1-this.dismantleCooldown/DISMANTLE_COOLDOWN);
+        if(i===2) fillPct=Math.min(1,this.fugaCharge/FUGA_CHARGE_REQ);
+
+        const ready = fillPct>=1;
+        const isUlt = i===2;
+
+        ctx.fillStyle='rgba(0,0,0,0.55)';
+        ctx.fillRect(ax,abY,aw,22);
+        // Fill bar
+        const barCol = isUlt ? (ready?'#ffe066':'#886600') : (ready?'#bbb':'#555');
+        ctx.fillStyle=barCol;
+        ctx.fillRect(ax, abY+18, Math.floor(aw*fillPct), 4);
+        // Border — brighter if selected
+        ctx.strokeStyle = selected ? '#fff' : 'rgba(255,255,255,0.2)';
+        ctx.lineWidth = selected ? 1.8 : 1;
+        ctx.strokeRect(ax,abY,aw,22);
+        // Label
+        const labelCol = !ready ? '#555' : isUlt ? '#ffe066' : '#ccc';
+        ctx.fillStyle = labelCol;
+        ctx.font=`700 9px 'Rajdhani',sans-serif`;
+        ctx.textAlign='center';
+        ctx.fillText(abilityNames[i], ax+aw/2, abY+13);
+      }
+
+      // "selected" triangle indicator
+      ctx.textAlign='center';
+      ctx.fillStyle='#fff';
+      const aw=86,gap=4;
+      const selAx = flip
+        ? bx+bw-(this.selectedAbility+1)*(aw+gap)+gap + aw/2
+        : bx + this.selectedAbility*(aw+gap) + aw/2;
+      ctx.globalAlpha=0.6+0.4*Math.abs(Math.sin(Date.now()*0.006));
+      ctx.font=`700 8px 'Rajdhani',sans-serif`;
+      ctx.fillText('▲', selAx, abY+32);
+      ctx.globalAlpha=1;
+      ctx.fillStyle='#888'; ctx.font=`500 9px 'Rajdhani',sans-serif`;
+      ctx.fillText(this.playerNum===1 ? '[H] SWITCH  [G] USE' : '[[] SWITCH  [P] USE', bx+bw/2, abY+42);
+
+      // Domain charge bar
+      const domY = abY+52;
+      const domPct = Math.min(1, this.domainCharge/DOMAIN_CHARGE_REQ);
+      const domReady = domPct>=1;
+      ctx.fillStyle='rgba(0,0,0,0.55)'; ctx.fillRect(bx,domY,bw,14);
+      ctx.fillStyle = domReady
+        ? `rgba(220,100,0,${0.7+0.3*Math.abs(Math.sin(Date.now()*0.005))})`
+        : '#5a2200';
+      ctx.fillRect(flip?bx+bw-Math.floor(bw*domPct):bx, domY, Math.floor(bw*domPct), 14);
+      ctx.strokeStyle = domReady ? 'rgba(255,140,0,0.7)' : 'rgba(120,50,0,0.4)';
+      ctx.lineWidth=1; ctx.strokeRect(bx,domY,bw,14);
+      ctx.fillStyle = domReady ? '#ffcc88' : '#885533';
+      ctx.font=`700 9px 'Rajdhani',sans-serif`; ctx.textAlign='center';
+      ctx.fillText(domReady ? 'DOMAIN: MALEVOLENT SHRINE [T]' : `DOMAIN ${Math.floor(domPct*100)}%`, bx+bw/2, domY+10);
+      if(!domReady && activeDomain && activeDomain.owner===this){
+        ctx.fillStyle='#f80'; ctx.fillText('DOMAIN ACTIVE', bx+bw/2, domY+10);
+      }
+    }
+
+    // Gojo ability HUD
+    if(this.type==='gojo'){
+      const abY = y+bh+38;
+      const abilityNames = ['LAPSE: BLUE','REVERSAL: RED','HOLLOW PURPLE'];
+      const cooldowns    = [this.lapseCooldown, this.reversalCooldown, 0];
+      const cdMaxes      = [LAPSE_COOLDOWN, REVERSAL_COOLDOWN, 1];
+      const charges      = [1, 1, Math.min(1, this.hollowCharge/HOLLOW_CHARGE_REQ)];
+      const colors       = ['#4af','#f44','#c060ff'];
+      const dimColors    = ['#246','#622','#502080'];
+
+      for(let i=0;i<3;i++){
+        const aw=86, gap=4;
+        const ax = flip ? bx+bw-(i+1)*(aw+gap)+gap : bx+i*(aw+gap);
+        const selected = this.gojoAbility===i;
+        const fillPct = i<2 ? Math.max(0,1-cooldowns[i]/cdMaxes[i]) : charges[i];
+        const ready = fillPct>=1;
+        ctx.fillStyle='rgba(0,0,0,0.55)';
+        ctx.fillRect(ax,abY,aw,22);
+        ctx.fillStyle = ready ? colors[i] : dimColors[i];
+        ctx.fillRect(flip?ax+aw-Math.floor(aw*fillPct):ax, abY+18, Math.floor(aw*fillPct), 4);
+        ctx.strokeStyle = selected ? '#fff' : 'rgba(255,255,255,0.2)';
+        ctx.lineWidth = selected ? 1.8 : 1;
+        ctx.strokeRect(ax,abY,aw,22);
+        const labelCol = !ready ? '#556' : i===0?'#adf':i===1?'#faa':'#e0b0ff';
+        ctx.fillStyle = labelCol;
+        ctx.font=`700 8px 'Rajdhani',sans-serif`;
+        ctx.textAlign='center';
+        ctx.fillText(abilityNames[i], ax+aw/2, abY+13);
+      }
+      // selector arrow
+      const aw=86, gap=4;
+      const selAx = flip
+        ? bx+bw-(this.gojoAbility+1)*(aw+gap)+gap+aw/2
+        : bx+this.gojoAbility*(aw+gap)+aw/2;
+      ctx.globalAlpha=0.6+0.4*Math.abs(Math.sin(Date.now()*0.006));
+      ctx.fillStyle='#fff'; ctx.font=`700 8px 'Rajdhani',sans-serif`; ctx.textAlign='center';
+      ctx.fillText('▲', selAx, abY+32);
+      ctx.globalAlpha=1;
+      ctx.fillStyle='#888'; ctx.font=`500 9px 'Rajdhani',sans-serif`;
+      ctx.fillText(this.playerNum===1 ? '[H] SWITCH  [G] USE' : '[[] SWITCH  [P] USE', bx+bw/2, abY+42);
+
+      // Gojo domain charge bar
+      const gDomY = abY+52;
+      const gDomPct = Math.min(1, this.domainCharge/DOMAIN_CHARGE_REQ);
+      const gDomReady = gDomPct>=1;
+      ctx.fillStyle='rgba(0,0,0,0.55)'; ctx.fillRect(bx,gDomY,bw,14);
+      ctx.fillStyle = gDomReady ? `rgba(60,160,240,${0.7+0.3*Math.abs(Math.sin(Date.now()*0.005))})` : '#0a2a4a';
+      ctx.fillRect(flip?bx+bw-Math.floor(bw*gDomPct):bx, gDomY, Math.floor(bw*gDomPct), 14);
+      ctx.strokeStyle = gDomReady ? 'rgba(80,160,240,0.7)' : 'rgba(30,80,140,0.4)';
+      ctx.lineWidth=1; ctx.strokeRect(bx,gDomY,bw,14);
+      ctx.fillStyle = gDomReady ? '#8cf' : '#358';
+      ctx.font=`700 9px 'Rajdhani',sans-serif`; ctx.textAlign='center';
+      ctx.fillText(gDomReady ? 'DOMAIN: INFINITE VOID [Y]' : `DOMAIN ${Math.floor(gDomPct*100)}%`, bx+bw/2, gDomY+10);
+    }
+
+    // Yuji HUD
+    if(this.type==='yuji'){
+      const abY = y+bh+38;
+      const pbLabel = this.playerNum===1 ? 'PIERCING BLOOD [G]' : 'PIERCING BLOOD [P]';
+      const onCooldown = this.pbCooldown > 0;
+      const isCharging = this.pbChargeTime > 0;
+      const tier = this.pbChargeTime>=2000 ? 2 : this.pbChargeTime>=1000 ? 1 : 0;
+      const fullyCharged = this.pbChargeTime >= PB_CHARGE_MAX;
+
+      ctx.fillStyle='rgba(0,0,0,0.55)'; ctx.fillRect(bx,abY,bw,14);
+
+      if(onCooldown){
+        // Cooldown: grey drain bar showing time remaining
+        const cdPct = this.pbCooldown / PB_COOLDOWN;
+        const cdW = Math.floor(bw * (1 - cdPct));
+        ctx.fillStyle='#222'; ctx.fillRect(bx,abY,bw,14);
+        ctx.fillStyle='#443333'; ctx.fillRect(flip?bx+bw-cdW:bx, abY, cdW, 14);
+        // Animated stripe sweep
+        ctx.globalAlpha=0.18;
+        for(let sx2=0;sx2<bw;sx2+=12){
+          const ox2 = ((Date.now()*0.04)%12);
+          ctx.fillStyle='#fff';
+          ctx.fillRect(bx+(sx2+ox2)%bw, abY, 5, 14);
+        }
+        ctx.globalAlpha=1;
+        ctx.strokeStyle='rgba(100,40,40,0.5)'; ctx.lineWidth=1; ctx.strokeRect(bx,abY,bw,14);
+        ctx.fillStyle='#775555'; ctx.font=`700 9px 'Rajdhani',sans-serif`; ctx.textAlign='center';
+        ctx.fillText(`COOLDOWN  ${(this.pbCooldown/1000).toFixed(1)}s`, bx+bw/2, abY+10);
+      } else if(isCharging){
+        // Charging: fill red based on charge
+        const chargePct = Math.min(1, this.pbChargeTime / PB_CHARGE_MAX);
+        const barCol = fullyCharged ? '#ff2222' : tier===2 ? '#cc1111' : tier===1 ? '#880000' : '#550000';
+        ctx.fillStyle=barCol;
+        if(fullyCharged){
+          // Pulse the whole bar when full
+          ctx.globalAlpha = 0.7 + 0.3*Math.abs(Math.sin(Date.now()*0.015));
+        }
+        ctx.fillRect(flip?bx+bw-Math.floor(bw*chargePct):bx, abY, Math.floor(bw*chargePct), 14);
+        ctx.globalAlpha=1;
+        ctx.strokeStyle='rgba(200,0,0,0.5)'; ctx.lineWidth=1; ctx.strokeRect(bx,abY,bw,14);
+        // Tier markers
+        for(const m of [1000/PB_CHARGE_MAX, 2000/PB_CHARGE_MAX]){
+          const mx2 = flip ? bx+bw-bw*m : bx+bw*m;
+          ctx.strokeStyle='rgba(255,100,100,0.6)'; ctx.lineWidth=1;
+          ctx.beginPath(); ctx.moveTo(mx2,abY); ctx.lineTo(mx2,abY+14); ctx.stroke();
+        }
+        const dmgLabels = ['10▸','20▸▸','30 MAX▸▸▸'];
+        ctx.fillStyle = fullyCharged ? '#ff6666' : '#ffaaaa';
+        ctx.font=`700 9px 'Rajdhani',sans-serif`; ctx.textAlign='center';
+        ctx.fillText(fullyCharged ? '▸▸▸ MAX CHARGE ▸▸▸' : `CHARGING  ${dmgLabels[tier]}`, bx+bw/2, abY+10);
+      } else {
+        // Ready
+        ctx.fillStyle='#330000'; ctx.fillRect(bx,abY,bw,14);
+        ctx.strokeStyle='rgba(180,0,0,0.3)'; ctx.lineWidth=1; ctx.strokeRect(bx,abY,bw,14);
+        ctx.fillStyle='#884444'; ctx.font=`700 9px 'Rajdhani',sans-serif`; ctx.textAlign='center';
+        ctx.fillText(`${pbLabel}  —  hold to charge`, bx+bw/2, abY+10);
+      }
+
+      // Black Blur cooldown bar
+      const bbLabel = this.playerNum===1 ? 'BLACK BLUR [H]' : 'BLACK BLUR [[]';
+      const bbY = abY + 18;
+      const bbOnCD = this.bbCooldown > 0;
+      const bbInUse = this.state === S.BLACKBLUR;
+      ctx.fillStyle='rgba(0,0,0,0.5)'; ctx.fillRect(bx,bbY,bw,12);
+      if(bbOnCD){
+        const cdPct2 = 1 - this.bbCooldown/BB_COOLDOWN;
+        ctx.fillStyle='#1a1a1a'; ctx.fillRect(bx,bbY,bw,12);
+        ctx.fillStyle='#222233'; ctx.fillRect(flip?bx+bw-Math.floor(bw*cdPct2):bx,bbY,Math.floor(bw*cdPct2),12);
+        ctx.globalAlpha=0.15;
+        for(let sx2=0;sx2<bw;sx2+=12){
+          const ox2=((Date.now()*0.04)%12);
+          ctx.fillStyle='#fff'; ctx.fillRect(bx+(sx2+ox2)%bw,bbY,5,12);
+        }
+        ctx.globalAlpha=1;
+        ctx.fillStyle='#556'; ctx.font=`700 9px 'Rajdhani',sans-serif`; ctx.textAlign='center';
+        ctx.fillText(`${bbLabel}  CD ${(this.bbCooldown/1000).toFixed(1)}s`, bx+bw/2, bbY+9);
+      } else if(bbInUse){
+        ctx.fillStyle='#334'; ctx.fillRect(bx,bbY,bw,12);
+        const pulse=0.6+0.4*Math.abs(Math.sin(Date.now()*0.012));
+        ctx.globalAlpha=pulse; ctx.fillStyle='#aaccff';
+        ctx.font=`700 9px 'Rajdhani',sans-serif`; ctx.textAlign='center';
+        ctx.fillText('▸▸▸ BLACK BLUR ACTIVE ▸▸▸', bx+bw/2, bbY+9);
+        ctx.globalAlpha=1;
+      } else {
+        ctx.fillStyle='#1a1a2a'; ctx.fillRect(bx,bbY,bw,12);
+        ctx.strokeStyle='rgba(80,80,160,0.4)'; ctx.lineWidth=1; ctx.strokeRect(bx,bbY,bw,12);
+        ctx.fillStyle='#6688aa'; ctx.font=`700 9px 'Rajdhani',sans-serif`; ctx.textAlign='center';
+        ctx.fillText(`${bbLabel}  —  lunge combo`, bx+bw/2, bbY+9);
+      }
+    }
+  }
+}
+
+function overlaps(a,b){ return a.x<b.x+b.w&&a.x+a.w>b.x&&a.y<b.y+b.h&&a.y+a.h>b.y; }
+
+// ═══════════════════════════════════════════════════════════
+//  CHARACTER REGISTRY
+//  To add your own character:
+//  1. Push a new object into the CHARACTERS array below.
+//  2. Required fields:
+//       name   – Display name (string)
+//       type   – Unique id string used in ability logic (e.g. 'mychar')
+//       color  – Main limb color (CSS color string)
+//       dimColor – Shadow/dim limb color
+//  3. Optional fields:
+//       image  – URL or base64 data-URI for a custom avatar image shown
+//                in the character select screen (64×64 display size).
+//                Example: image: 'https://example.com/mychar.png'
+//       description – Short description shown on the select screen.
+//  4. Custom abilities:
+//       Add ability logic inside Player._startAbilityA() / _tickAbilityA()
+//       methods and gate them with  if(this.type==='mychar'){ ... }
+//       Then add the type to the ability system switch in update().
+//  5. Ability keys are shared (G/H for P1, P/[ for P2, T/Y for domains).
+// ═══════════════════════════════════════════════════════════
+const CHARACTERS = [
+  {
+    name: 'SUKUNA',
+    type: 'sukuna',
+    color: '#ff6666',
+    dimColor: '#dd3333',
+    description: 'King of Curses · Cleave / Dismantle / Fuga'
+  },
+  {
+    name: 'GOJO',
+    type: 'gojo',
+    color: '#66eeff',
+    dimColor: '#33bbdd',
+    description: 'Strongest · Lapse Blue / Reversal Red / Hollow Purple'
+  },
+  {
+    name: 'YUJI',
+    type: 'yuji',
+    color: '#f5a623',
+    dimColor: '#c47d0e',
+    description: 'Divergent Fist · Melee Combos / Black Flash'
+  }
+  // ── ADD YOUR CHARACTER HERE ──────────────────────────────
+  // {
+  //   name: 'MY CHAR',
+  //   type: 'mychar',
+  //   color: '#aaffaa',
+  //   dimColor: '#44bb44',
+  //   image: 'https://i.imgur.com/yourimage.png',  // optional
+  //   description: 'Your character description here'
+  // },
+  // ─────────────────────────────────────────────────────────
+];
+
+let p1CharIdx=0, p2CharIdx=1;  // selected character indices
+
+function buildPlayer(charIdx, startX, facing, ctrl, playerNum){
+  const ch = CHARACTERS[charIdx] || CHARACTERS[0];
+  return new Player({
+    x: startX,
+    name: ch.name,
+    type: ch.type,
+    facing,
+    ctrl,
+    charColor: ch.color,
+    charDimColor: ch.dimColor,
+    playerNum: playerNum
+  });
+}
+
+let p1 = buildPlayer(0, 170,  1, {left:'KeyA',right:'KeyD',jmp:'KeyW',atk:'KeyF'}, 1);
+let p2 = buildPlayer(1, 690, -1, {left:'ArrowLeft',right:'ArrowRight',jmp:'ArrowUp',atk:'Semicolon'}, 2);
+
+// Background
+const bgKanji=[{ch:'呪',x:88,y:200,s:115,a:.04},{ch:'術',x:790,y:178,s:115,a:.04},{ch:'廻',x:440,y:260,s:88,a:.025}];
+const driftP=Array.from({length:28},()=>({x:Math.random()*W,y:Math.random()*H,vy:-(0.14+Math.random()*.3),r:.5+Math.random()*1.2,a:.05+Math.random()*.1}));
+
+function drawBG(){
+  const bg=ctx.createLinearGradient(0,0,0,H);
+  bg.addColorStop(0,'#3a3830'); bg.addColorStop(.5,'#2e2c26'); bg.addColorStop(1,'#242220');
+  ctx.fillStyle=bg; ctx.fillRect(0,0,W,H);
+  ctx.strokeStyle='rgba(255,255,255,.018)'; ctx.lineWidth=1;
+  for(let x=0;x<W;x+=80){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,GND);ctx.stroke();}
+  for(let y=60;y<GND;y+=80){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(W,y);ctx.stroke();}
+  ctx.textAlign='center'; ctx.textBaseline='middle';
+  for(const k of bgKanji){ctx.font=`${k.s}px serif`;ctx.fillStyle='#888';ctx.globalAlpha=k.a;ctx.fillText(k.ch,k.x,k.y);}
+  ctx.globalAlpha=1; ctx.textBaseline='alphabetic';
+  for(const p of driftP){p.y+=p.vy;if(p.y<0)p.y=H;ctx.globalAlpha=p.a;ctx.fillStyle='#aaa';ctx.beginPath();ctx.arc(p.x,p.y,p.r,0,Math.PI*2);ctx.fill();}
+  ctx.globalAlpha=1;
+  const gf=ctx.createLinearGradient(0,GND,0,H);
+  gf.addColorStop(0,'#1e1c18'); gf.addColorStop(1,'#141210');
+  ctx.fillStyle=gf; ctx.fillRect(0,GND,W,H-GND);
+  ctx.strokeStyle='rgba(200,195,185,.38)'; ctx.lineWidth=1.5;
+  ctx.beginPath(); ctx.moveTo(0,GND); ctx.lineTo(W,GND); ctx.stroke();
+}
+
+function drawHUDOverlay(){
+  ctx.textAlign='center'; ctx.font=`700 14px 'Rajdhani',sans-serif`;
+  ctx.fillStyle='rgba(200,195,185,.2)'; ctx.fillText('CURSED CLASH',W/2,30);
+  p1.drawHUD(22,false); p2.drawHUD(W-22,true);
+  // Lives indicators — drawn below the HUD ability bars
+  const livesY = 130;
+  for(let i=0;i<3;i++){
+    const px = 22 + i*16;
+    ctx.fillStyle = i<p1lives ? '#cc2222' : 'rgba(180,50,50,0.15)';
+    ctx.strokeStyle = i<p1lives ? '#ff4444' : 'rgba(180,50,50,0.3)';
+    ctx.lineWidth=1;
+    ctx.beginPath(); ctx.arc(px, livesY, 6, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+  }
+  for(let i=0;i<3;i++){
+    const px = W-22 - i*16;
+    ctx.fillStyle = i<p2lives ? '#cc2222' : 'rgba(180,50,50,0.15)';
+    ctx.strokeStyle = i<p2lives ? '#ff4444' : 'rgba(180,50,50,0.3)';
+    ctx.lineWidth=1;
+    ctx.beginPath(); ctx.arc(px, livesY, 6, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+  }
+}
+
+let phase='home', homeT=0, winner=null;
+let p1lives=3, p2lives=3;
+let roundWinner=null, roundDelay=0;
+let fightTxt='', fightTxtT=0;
+// Character select
+let p1SelectDown=false, p2SelectDown=false;
+let p1ConfirmDown=false, p2ConfirmDown=false;
+let p1Confirmed=false, p2Confirmed=false;
+function showTxt(t,d=900){fightTxt=t;fightTxtT=d;}
+
+function clearProjectiles(){
+  parts.length=0; rings.length=0; dmgNums.length=0; cleaves.length=0;
+  dismantleEvents.length=0; slashMarks.length=0;
+  fugaShots.length=0; explosions.length=0; flameTrails.length=0;
+  lapseOrbs.length=0; reversalShots.length=0; hollowShots.length=0;
+  hollowNukeOrb=null; purpleFlash=0;
+  blackFlashes.length=0; blackFlashes._screenFlash=0;
+  piercingBeams.length=0;
+}
+
+function drawFightText(dt){
+  if(fightTxtT<=0) return;
+  fightTxtT=Math.max(0,fightTxtT-dt);
+  const life=fightTxtT/900;
+  ctx.save(); ctx.globalAlpha=Math.min(1,life*2.5); ctx.textAlign='center';
+  ctx.translate(W/2,H/2-50); ctx.scale(1+(1-life)*.1,1+(1-life)*.1);
+  ctx.font=`700 62px 'Rajdhani',sans-serif`;
+  ctx.strokeStyle='rgba(0,0,0,.8)'; ctx.lineWidth=5; ctx.strokeText(fightTxt,0,0);
+  ctx.fillStyle='#d8d4cc'; ctx.fillText(fightTxt,0,0);
+  ctx.restore();
+}
+
+function drawHome(){
+  const a=Math.min(1,homeT/500);
+  ctx.save(); ctx.globalAlpha=a; ctx.textAlign='center';
+  // Title
+  ctx.font=`700 80px 'Rajdhani',sans-serif`;
+  ctx.strokeStyle='rgba(0,0,0,.85)'; ctx.lineWidth=6;
+  ctx.strokeText('CURSED CLASH',W/2,H/2-100);
+  ctx.fillStyle='#d8d4cc'; ctx.fillText('CURSED CLASH',W/2,H/2-100);
+  // Subtitle
+  ctx.font=`500 15px 'Rajdhani',sans-serif`; ctx.fillStyle='rgba(180,175,165,.7)';
+  ctx.fillText('P1: A / D move  ·  W jump  ·  F attack  ·  G/H abilities',W/2,H/2-44);
+  ctx.fillText('P2: ← / → move  ·  ↑ jump  ·  ; attack  ·  P/[ abilities',W/2,H/2-22);
+  ctx.fillText('Best of 3 lives',W/2,H/2+6);
+  // Start button
+  const bw=220,bh=48,bx=W/2-bw/2,by=H/2+38;
+  const btnHover = homeT>600;
+  ctx.fillStyle=btnHover?'rgba(200,195,185,0.18)':'rgba(200,195,185,0.08)';
+  ctx.strokeStyle=btnHover?'rgba(200,195,185,0.7)':'rgba(200,195,185,0.35)';
+  ctx.lineWidth=1.5;
+  // Manual rounded rect (roundRect not supported in all browsers)
+  const r=6;
+  ctx.beginPath();
+  ctx.moveTo(bx+r,by); ctx.lineTo(bx+bw-r,by);
+  ctx.quadraticCurveTo(bx+bw,by,bx+bw,by+r);
+  ctx.lineTo(bx+bw,by+bh-r);
+  ctx.quadraticCurveTo(bx+bw,by+bh,bx+bw-r,by+bh);
+  ctx.lineTo(bx+r,by+bh);
+  ctx.quadraticCurveTo(bx,by+bh,bx,by+bh-r);
+  ctx.lineTo(bx,by+r);
+  ctx.quadraticCurveTo(bx,by,bx+r,by);
+  ctx.closePath();
+  ctx.fill(); ctx.stroke();
+  ctx.fillStyle=btnHover?'#d8d4cc':'rgba(200,195,185,0.6)';
+  ctx.font=`700 20px 'Rajdhani',sans-serif`; ctx.letterSpacing='3px';
+  ctx.fillText('START',W/2,by+31);
+  ctx.restore();
+}
+
+function drawCharSelect(){
+  ctx.save(); ctx.textAlign='center';
+  // Title
+  ctx.font=`700 36px 'Rajdhani',sans-serif`;
+  ctx.fillStyle='#d8d4cc';
+  ctx.fillText('SELECT CHARACTER', W/2, 55);
+  ctx.font=`500 12px 'Rajdhani',sans-serif`; ctx.fillStyle='rgba(180,175,165,0.6)';
+  ctx.fillText('P1: A/D cycle  F confirm     P2: ←/→ cycle  ; confirm', W/2, 76);
+
+  const panelW=200, panelH=220, gap=40;
+  const p1x=W/2-panelW-gap/2, p2x=W/2+gap/2;
+
+  for(let p=0;p<2;p++){
+    const px=p===0?p1x:p2x;
+    const idx=p===0?p1CharIdx:p2CharIdx;
+    const confirmed=p===0?p1Confirmed:p2Confirmed;
+    const ch=CHARACTERS[idx];
+    const py=H/2-panelH/2;
+
+    // Panel background
+    ctx.fillStyle=confirmed?'rgba(255,255,255,0.08)':'rgba(0,0,0,0.4)';
+    ctx.fillRect(px,py,panelW,panelH);
+    ctx.strokeStyle=confirmed?ch.color:'rgba(255,255,255,0.2)';
+    ctx.lineWidth=confirmed?2:1;
+    ctx.strokeRect(px,py,panelW,panelH);
+
+    // Player label
+    ctx.fillStyle='rgba(180,175,165,0.55)'; ctx.font=`700 11px 'Rajdhani',sans-serif`;
+    ctx.fillText(`PLAYER ${p+1}`, px+panelW/2, py+18);
+
+    // Character avatar / color swatch
+    const swatchY=py+34;
+    if(ch.image){
+      const img=new Image(); img.src=ch.image;
+      ctx.drawImage(img, px+panelW/2-32, swatchY, 64, 64);
+    } else {
+      // Stick figure preview in character color
+      ctx.strokeStyle=ch.color; ctx.lineWidth=2.5;
+      const fx=px+panelW/2, fy=swatchY+16;
+      ctx.beginPath(); ctx.arc(fx,fy,10,0,Math.PI*2); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(fx,fy+10); ctx.lineTo(fx,fy+34); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(fx-14,fy+20); ctx.lineTo(fx+14,fy+20); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(fx,fy+34); ctx.lineTo(fx-10,fy+54); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(fx,fy+34); ctx.lineTo(fx+10,fy+54); ctx.stroke();
+    }
+
+    // Character name
+    ctx.fillStyle=ch.color; ctx.font=`700 18px 'Rajdhani',sans-serif`;
+    ctx.fillText(ch.name, px+panelW/2, swatchY+78);
+
+    // Description
+    ctx.fillStyle='rgba(180,175,165,0.7)'; ctx.font=`500 10px 'Rajdhani',sans-serif`;
+    const words=(ch.description||'').split(' · ');
+    words.forEach((w,wi)=>ctx.fillText(w, px+panelW/2, swatchY+96+wi*14));
+
+    // Arrow navigation
+    ctx.fillStyle='rgba(200,195,185,0.5)'; ctx.font=`700 18px 'Rajdhani',sans-serif`;
+    ctx.fillText('◀', px+16, py+panelH/2+6);
+    ctx.fillText('▶', px+panelW-16, py+panelH/2+6);
+
+    // Confirm prompt / confirmed state
+    if(confirmed){
+      ctx.fillStyle=ch.color; ctx.font=`700 13px 'Rajdhani',sans-serif`;
+      ctx.fillText('✓ READY', px+panelW/2, py+panelH-14);
+    } else {
+      ctx.globalAlpha=0.6+0.4*Math.abs(Math.sin(Date.now()*0.005));
+      ctx.fillStyle='#d8d4cc'; ctx.font=`700 11px 'Rajdhani',sans-serif`;
+      ctx.fillText('PRESS F / ; TO CONFIRM', px+panelW/2, py+panelH-14);
+      ctx.globalAlpha=1;
+    }
+  }
+
+  // Both confirmed — countdown
+  if(p1Confirmed && p2Confirmed){
+    const elapsed = window._bothConfirmedTimer || 0;
+    const pct = elapsed / 1200;
+    ctx.globalAlpha = 0.7 + 0.3*Math.abs(Math.sin(Date.now()*0.01));
+    ctx.font=`700 22px 'Rajdhani',sans-serif`; ctx.fillStyle='#d8d4cc';
+    ctx.fillText('BOTH READY!', W/2, H-56);
+    ctx.globalAlpha = 1;
+    // Progress bar
+    const bw=200, bh=5, bx=W/2-bw/2, by=H-38;
+    ctx.fillStyle='rgba(0,0,0,0.4)'; ctx.fillRect(bx,by,bw,bh);
+    ctx.fillStyle='#d8d4cc'; ctx.fillRect(bx,by,bw*pct,bh);
+    ctx.strokeStyle='rgba(255,255,255,0.2)'; ctx.lineWidth=1; ctx.strokeRect(bx,by,bw,bh);
+  }
+  ctx.restore();
+}
+
+function drawRoundEnd(){
+  ctx.fillStyle='rgba(0,0,0,.55)'; ctx.fillRect(0,0,W,H);
+  ctx.textAlign='center';
+  ctx.font=`700 48px 'Rajdhani',sans-serif`;
+  ctx.strokeStyle='rgba(0,0,0,.85)'; ctx.lineWidth=5;
+  ctx.strokeText(roundWinner.name+' WINS THE ROUND',W/2,H/2-16);
+  ctx.fillStyle='#d8d4cc'; ctx.fillText(roundWinner.name+' WINS THE ROUND',W/2,H/2-16);
+  ctx.font=`500 15px 'Rajdhani',sans-serif`; ctx.fillStyle='rgba(180,175,165,.65)';
+  ctx.fillText(`${p1.name}: ${p1lives} ❤  ·  ${p2.name}: ${p2lives} ❤`,W/2,H/2+22);
+  ctx.fillText('Next round starting...',W/2,H/2+48);
+}
+
+function drawMatchEnd(){
+  ctx.fillStyle='rgba(0,0,0,.55)'; ctx.fillRect(0,0,W,H);
+  ctx.textAlign='center';
+  ctx.font=`700 64px 'Rajdhani',sans-serif`;
+  ctx.strokeStyle='rgba(0,0,0,.85)'; ctx.lineWidth=6;
+  ctx.strokeText(winner.name+' WINS!',W/2,H/2-30);
+  ctx.fillStyle='#d8d4cc'; ctx.fillText(winner.name+' WINS!',W/2,H/2-30);
+  ctx.font=`500 17px 'Rajdhani',sans-serif`; ctx.fillStyle='rgba(170,165,155,.55)';
+  ctx.fillText('Press F or ; to return to menu',W/2,H/2+22);
+}
+
+let last=0;
+function loop(ts){
+  const dt=Math.min(ts-last,50); last=ts;
+  let sx=0,sy=0;
+  if(shakeMag>.5){sx=(Math.random()-.5)*shakeMag;sy=(Math.random()-.5)*shakeMag;shakeMag*=.78;}else shakeMag=0;
+  ctx.save();
+  const scaleX=canvas.width/W, scaleY=canvas.height/H;
+  ctx.scale(scaleX,scaleY);
+  ctx.translate(sx,sy);
+  drawBG();
+
+  if(phase==='home'){
+    homeT+=dt; p1.draw(); p2.draw(); drawHome();
+    if(keys['KeyF']||keys['Semicolon']){
+      phase='charSelect';
+      p1CharIdx=0; p2CharIdx=Math.min(1,CHARACTERS.length-1);
+      p1Confirmed=false; p2Confirmed=false;
+      p1SelectDown=false; p2SelectDown=false;
+      p1ConfirmDown=true; p2ConfirmDown=true; // prevent instant confirm from home screen keypress
+    }
+
+  } else if(phase==='charSelect'){
+    drawBG(); drawCharSelect();
+    // P1 navigation: A/D cycle, F confirm
+    const p1Left  = keys['KeyA'] && !p1SelectDown;
+    const p1Right = keys['KeyD'] && !p1SelectDown;
+    const p1Conf  = keys['KeyF'] && !p1ConfirmDown;
+    if(keys['KeyA']||keys['KeyD']) p1SelectDown=true; else p1SelectDown=false;
+    if(keys['KeyF']) p1ConfirmDown=true; else p1ConfirmDown=false;
+    if(!p1Confirmed){
+      if(p1Left)  p1CharIdx=(p1CharIdx-1+CHARACTERS.length)%CHARACTERS.length;
+      if(p1Right) p1CharIdx=(p1CharIdx+1)%CHARACTERS.length;
+    }
+    if(p1Conf) p1Confirmed=!p1Confirmed;
+
+    // P2 navigation: ←/→ cycle, ; confirm
+    const p2Left  = keys['ArrowLeft'] && !p2SelectDown;
+    const p2Right = keys['ArrowRight'] && !p2SelectDown;
+    const p2Conf  = keys['Semicolon'] && !p2ConfirmDown;
+    if(keys['ArrowLeft']||keys['ArrowRight']) p2SelectDown=true; else p2SelectDown=false;
+    if(keys['Semicolon']) p2ConfirmDown=true; else p2ConfirmDown=false;
+    if(!p2Confirmed){
+      if(p2Left)  p2CharIdx=(p2CharIdx-1+CHARACTERS.length)%CHARACTERS.length;
+      if(p2Right) p2CharIdx=(p2CharIdx+1)%CHARACTERS.length;
+    }
+    if(p2Conf) p2Confirmed=!p2Confirmed;
+
+    // Both confirmed → countdown then start fight
+    if(p1Confirmed && p2Confirmed){
+      if(!window._bothConfirmedTimer) window._bothConfirmedTimer = 0;
+      window._bothConfirmedTimer += dt;
+      if(window._bothConfirmedTimer >= 1200){
+        window._bothConfirmedTimer = 0;
+        p1 = buildPlayer(p1CharIdx, 170,  1, {left:'KeyA',right:'KeyD',jmp:'KeyW',atk:'KeyF'}, 1);
+        p2 = buildPlayer(p2CharIdx, 690, -1, {left:'ArrowLeft',right:'ArrowRight',jmp:'ArrowUp',atk:'Semicolon'}, 2);
+        p1lives=3; p2lives=3; clearProjectiles();
+        hollowNukeOrb=null; purpleFlash=0; activeDomain=null; domainFlash=0;
+        winner=null; roundWinner=null;
+        phase='fight'; showTxt('FIGHT!');
+      }
+    } else {
+      window._bothConfirmedTimer = 0;
+    }
+
+  } else if(phase==='fight'){
+    const fdt = dt * timeScale;
+    p1.update(fdt,p2); p2.update(fdt,p1);
+    for(const [atk,def] of [[p1,p2],[p2,p1]]){
+      if(atk.hitboxOn&&!atk.atkHit&&def.hittable){
+        const ab=atk.atkBox(), db=def.bodyBox();
+        if(ab&&overlaps(ab,db)) atk.landHit(def);
+      }
+    }
+    // Cleave projectile collision
+    for(let i=cleaves.length-1;i>=0;i--){
+      const cl=cleaves[i];
+      if(cl.hit) continue;
+      const def = cl.owner===p1 ? p2 : p1;
+      if(!def.hittable) continue;
+      const db=def.bodyBox();
+      const cb={x:cl.x - 48, y:cl.y - 48, w:96, h:96};
+      if(overlaps(cb,db)){
+        cl.hit=true;
+        const mx=def.x+PW/2, my=def.y+PH/2;
+        def.hp=Math.max(0,def.hp-CLEAVE_DMG); def.flash=280;
+        addParts(mx,my,'#ddd',14,5); addRing(mx,my,'#fff',55);
+        addDmg(mx,def.y-14,CLEAVE_DMG,'#eee'); doShake(9);
+        if(cl.owner.type==='sukuna') cl.owner.fugaCharge=Math.min(FUGA_CHARGE_REQ,cl.owner.fugaCharge+CLEAVE_DMG);
+        cl.owner.domainCharge=Math.min(DOMAIN_CHARGE_REQ,cl.owner.domainCharge+CLEAVE_DMG);
+        if(def.hp<=0){ def._initRd(cl.dir*9,-6,.12*cl.dir); def.ss(S.DEAD); }
+        else { def._initRd(cl.dir*7,-4,.09*cl.dir); def.ss(S.RAGD,RAGD_MS); }
+        cleaves.splice(i,1);
+      }
+    }
+    tickCleaves(fdt);
+    tickLapseOrbs(fdt, p1, p2);
+    // Reversal Red collision
+    for(let i=reversalShots.length-1;i>=0;i--){
+      const rs=reversalShots[i];
+      if(rs.hit) continue;
+      const def = rs.owner===p1 ? p2 : p1;
+      if(!def.hittable) continue;
+      const db=def.bodyBox();
+      const rb={x:rs.x-28,y:rs.y-10,w:56,h:20};
+      if(overlaps(rb,db)){
+        rs.hit=true;
+        const mx=def.x+PW/2, my=def.y+PH/2;
+        def.hp=Math.max(0,def.hp-REVERSAL_DMG); def.flash=260;
+        addReversalExplosion(mx,my,rs.dir);
+        addDmg(mx,def.y-14,REVERSAL_DMG,'#f88');
+        if(rs.owner.type==='gojo') rs.owner.hollowCharge=Math.min(HOLLOW_CHARGE_REQ,rs.owner.hollowCharge+REVERSAL_DMG);
+        rs.owner.domainCharge=Math.min(DOMAIN_CHARGE_REQ,rs.owner.domainCharge+REVERSAL_DMG);
+        if(def.hp<=0){ def._initRd(rs.dir*REVERSAL_KB,-6,.13*rs.dir); def.ss(S.DEAD); }
+        else { def._initRd(rs.dir*REVERSAL_KB,-5,.11*rs.dir); def.ss(S.RAGD,RAGD_MS); }
+        reversalShots.splice(i,1);
+      }
+    }
+    tickReversalShots(fdt);
+    // Reversal → Hollow Nuke orb collision
+    if(hollowNukeOrb && !hollowNukeOrb.charged){
+      for(let i=reversalShots.length-1;i>=0;i--){
+        const rs=reversalShots[i];
+        if(rs.owner!==hollowNukeOrb.owner) continue; // must be same player
+        const dx=rs.x-hollowNukeOrb.x, dy=rs.y-hollowNukeOrb.y;
+        if(Math.sqrt(dx*dx+dy*dy)<44){
+          hollowNukeOrb.charged=true;
+          addRing(hollowNukeOrb.x,hollowNukeOrb.y,'#c060ff',80);
+          addParts(hollowNukeOrb.x,hollowNukeOrb.y,'#f44',14,5);
+          doShake(8);
+          reversalShots.splice(i,1); break;
+        }
+      }
+    }
+    tickHollowNuke(fdt, p1, p2);
+    // Hollow Purple collision
+    for(let i=hollowShots.length-1;i>=0;i--){
+      const hs=hollowShots[i];
+      if(hs.hit) continue;
+      const def = hs.owner===p1 ? p2 : p1;
+      if(!def.hittable) continue;
+      const db=def.bodyBox();
+      const hb={x:hs.x-HOLLOW_BALL_R,y:hs.y-HOLLOW_BALL_R,w:HOLLOW_BALL_R*2,h:HOLLOW_BALL_R*2};
+      if(overlaps(hb,db)){
+        hs.hit=true;
+        const mx=def.x+PW/2, my=def.y+PH/2;
+        addHollowExplosion(mx,my);
+        def.hp=Math.max(0,def.hp-HOLLOW_DMG); def.flash=700;
+        addDmg(mx,def.y-22,HOLLOW_DMG,'#c060ff'); doShake(20);
+        hs.owner.domainCharge=Math.min(DOMAIN_CHARGE_REQ,hs.owner.domainCharge+HOLLOW_DMG);
+        if(def.hp<=0){ def._initRd(hs.dir*14,-9,.16*hs.dir); def.ss(S.DEAD); }
+        else { def._initRd(hs.dir*14,-8,.15*hs.dir); def.ss(S.RAGD,RAGD_MS*1.8); }
+        hollowShots.splice(i,1);
+      }
+    }
+    tickHollowShots(fdt);
+    // Fuga shot collision
+    for(let i=fugaShots.length-1;i>=0;i--){
+      const fs=fugaShots[i];
+      if(fs.hit) continue;
+      const def = fs.owner===p1 ? p2 : p1;
+      if(!def.hittable) continue;
+      const db=def.bodyBox();
+      const fb={x:fs.x-16,y:fs.y-16,w:32,h:32};
+      if(overlaps(fb,db)){
+        fs.hit=true;
+        const mx=def.x+PW/2, my=def.y+PH/2;
+        triggerFugaExplosion(mx, my);
+        addParts(mx,my,'#f80',22,7);
+        def.hp=Math.max(0,def.hp-FUGA_DMG); def.flash=600;
+        addDmg(mx,def.y-20,FUGA_DMG,'#f80'); doShake(18);
+        fs.owner.domainCharge=Math.min(DOMAIN_CHARGE_REQ,fs.owner.domainCharge+FUGA_DMG);
+        if(def.hp<=0){ def._initRd(fs.dir*12,-8,.15*fs.dir); def.ss(S.DEAD); }
+        else { def._initRd(fs.dir*14,-9,.16*fs.dir); def.ss(S.RAGD,RAGD_MS*1.5); }
+        fugaShots.splice(i,1);
+      }
+    }
+    tickFugaShots(fdt); tickExplosions(fdt); tickFlameTrails(fdt);
+    tickBlackFlashes(fdt);
+    tickPiercingBeams(fdt, p1, p2);
+    tickDomain(fdt, p1, p2);
+    tickHollowNuke(fdt, p1, p2);
+    if(domainFlash>0) domainFlash=Math.max(0,domainFlash-dt);
+    tickParts(); tickRings(); tickDmgNums(); tickDismantleEvents(fdt); tickSlashMarks(fdt);
+
+    // Round end check
+    if(!roundWinner){
+      if(p1.hp<=0 && p2.hp>0){ roundWinner=p2; p1lives--; }
+      else if(p2.hp<=0 && p1.hp>0){ roundWinner=p1; p2lives--; }
+      else if(p1.hp<=0 && p2.hp<=0){ roundWinner=p1; p1lives--; p2lives--; }
+      if(roundWinner){ timeScale=1; phase='roundend'; roundDelay=2400; }
+    }
+    drawParts(); drawRings(); drawCleaves(); drawLapseOrbs(); drawReversalShots(); drawHollowShots(Date.now()); drawFlameTrails(); drawExplosions(); drawFugaShots();
+    drawDomain();
+    drawSlashMarks();
+    drawHollowNuke(Date.now());
+    p1.draw(); p2.draw();
+    drawBlackFlashes(); drawPiercingBeams();
+    // Purple flash for hollow nuke
+    if(purpleFlash>0){
+      purpleFlash=Math.max(0,purpleFlash-dt);
+      const prog=purpleFlash/700;
+      const alpha=prog>0.5?(1-prog)*2:prog*2;
+      ctx.save(); ctx.globalAlpha=Math.min(1,alpha*0.85);
+      ctx.fillStyle='#6000cc'; ctx.fillRect(0,0,W,H);
+      ctx.restore();
+    }
+    // Domain flash — fade to full black then fade back
+    if(domainFlash>0){
+      const prog = domainFlash/1000; // 1→0 as flash plays out
+      // Peaks at full black halfway through (prog=0.5)
+      const alpha = prog > 0.5 ? (1-prog)*2 : prog*2;
+      ctx.save();
+      ctx.globalAlpha = Math.min(1, alpha);
+      ctx.fillStyle = '#000';
+      ctx.fillRect(0,0,W,H);
+      ctx.restore();
+    }
+    // Slow-motion vignette (Black Blur minigame phase)
+    if(timeScale < 0.5){
+      const depth = 1 - timeScale/0.5;
+      ctx.save();
+      ctx.globalAlpha = depth * 0.45;
+      const vig = ctx.createRadialGradient(W/2,H/2,W*0.25,W/2,H/2,W*0.75);
+      vig.addColorStop(0,'rgba(0,0,0,0)');
+      vig.addColorStop(1,'rgba(0,0,20,1)');
+      ctx.fillStyle=vig; ctx.fillRect(0,0,W,H);
+      // Subtle blue tint
+      ctx.globalAlpha = depth * 0.08;
+      ctx.fillStyle='#0044aa'; ctx.fillRect(0,0,W,H);
+      ctx.restore();
+    }
+    drawDmgNums(); drawHUDOverlay(); drawFightText(dt);
+
+  } else if(phase==='roundend'){
+    tickParts(); tickRings(); tickExplosions(dt); tickFlameTrails(dt);
+    drawParts(); drawRings(); drawFlameTrails(); drawExplosions();
+    p1.draw(); p2.draw();
+    drawHUDOverlay(); drawRoundEnd();
+    roundDelay-=dt;
+    if(roundDelay<=0){
+      if(p1lives<=0||p2lives<=0){
+        winner = p1lives<=0 ? p2 : p1;
+        phase='end';
+      } else {
+        p1.reset(); p2.reset(); clearProjectiles();
+        roundWinner=null; activeDomain=null; domainFlash=0; phase='fight'; showTxt('FIGHT!');
+      }
+    }
+
+  } else {
+    tickParts(); tickRings();
+    drawParts(); drawRings();
+    p1.draw(); p2.draw();
+    drawHUDOverlay(); drawMatchEnd();
+    if(keys['KeyF']||keys['Semicolon']){
+      p1.reset(); p2.reset(); clearProjectiles();
+      p1lives=3; p2lives=3;
+      winner=null; roundWinner=null;
+      activeDomain=null; domainFlash=0;
+      hollowNukeOrb=null; purpleFlash=0;
+      p1Confirmed=false; p2Confirmed=false;
+      p1SelectDown=false; p2SelectDown=false; p1ConfirmDown=false; p2ConfirmDown=false;
+      phase='charSelect'; homeT=0;
+    }
+  }
+
+  ctx.restore();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
